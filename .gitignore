@@ -1,0 +1,4 @@
+.agents
+.xmake/
+build/
+*:Zone.Identifier
