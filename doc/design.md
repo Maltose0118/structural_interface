@@ -742,53 +742,40 @@ std::move(*static_cast<T*>(object)).consume();
 
 # 14. Field Access
 
-接口数据成员同样通过成员变量注入实现。
+接口数据成员同样通过成员变量注入实现，但 runtime wrapper 暴露的是原始字段指针。
 
 ```cpp
 obj.width
 ```
 
-其中 `width` 是一个 field proxy 成员变量，而不是真实的 `int` 子对象。
+当前库实现中，数据成员注入到 `existential` 本体的生成基类中。`obj.width` 的类型是字段的原始指针类型，例如 `int*` 或 `std::string*`。
 
-它可以提供引用转换或显式访问操作：
+因此用户显式解引用访问字段：
 
 ```cpp
-operator int&() const;
-
-int& get() const;
+*(obj.width) = 10;
+int value = *(obj.width);
 ```
 
-字段偏移保存在 `interface_metadata` 中。
+字段指针在 wrapper 构造时绑定到具体类型 `T` 的同名成员地址。copy / move 之后会重新绑定到新 wrapper 持有的对象字段。成员函数也通过同一个点访问视图暴露，因此函数调用写作 `obj.draw()`。
 
 访问过程：
 
 ```text
-field proxy member
+obj.width
         │
         ▼
-owner existential object
-        │
-        ▼
-object pointer
-        │
-        ▼
-field offset
-        │
-        ▼
-field
+T::field
 ```
 
 等价于：
 
 ```cpp
-return *reinterpret_cast<int*>(
-    static_cast<std::byte*>(object) + metadata->width_offset
-);
+constexpr auto member = /* reflected T::width */;
+obj.width = std::addressof(static_cast<T*>(object)->*member);
 ```
 
-字段访问不经过函数指针。
-
-仅进行一次固定偏移计算。
+这种设计保持表达式语义明确：字段名对应字段指针，库不额外模拟引用成员。
 
 ---
 
@@ -826,7 +813,7 @@ SI 自动选择小对象或大对象对应的生命周期函数。
 * `si::satisfies`
 * `interface_metadata`
 * callable 成员变量 proxy
-* field 成员变量 proxy
+* field 指针成员变量
 * 生命周期管理函数
 * 成员函数 thunk
 * 字段偏移

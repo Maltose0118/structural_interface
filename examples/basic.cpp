@@ -4,7 +4,8 @@
 
 // interface
 struct Shape {
-    float area() const;
+    std::string name;   // field member
+    float area() const; // function member
 };
 
 // unified function that accepts any type satisfying the Shape interface
@@ -14,6 +15,7 @@ float area(const si::satisfies<Shape> auto& shape) {
 
 // custom types that satisfy the Shape interface
 struct Circle {
+    std::string name;
     float radius{ 0.0f };
 
     float area() const {
@@ -21,6 +23,7 @@ struct Circle {
     }
 };
 struct Rectangle {
+    std::string name;
     float width{ 0.0f };
     float height{ 0.0f };
 
@@ -30,11 +33,14 @@ struct Rectangle {
 };
 
 int main() {
-    Circle circle{ 5.0f };
-    std::println("Circle area: {}", area(Circle{ 5.0f })); // static dispatch
+    Circle circle{ "Circle", 5.0f };
+    std::println("Circle area: {}", area(circle)); // static dispatch
 
-    std::vector<si::existential<Shape>> shapes{ Circle{ 3.0f }, Rectangle{ 4.0f, 6.0f } };
+    std::vector<si::existential<Shape>> shapes{ Circle{ "Circle", 3.0f }, Rectangle{ "Rectangle", 4.0f, 6.0f } };
     for (const auto& shape : shapes) {
-        std::println("Shape area: {}", area(shape)); // dynamic dispatch
+        std::println("Shape {} area: {}", *(shape.name), shape.area()); // dynamic dispatch
     }
+
+    *(shapes[0].name) = "Updated Circle"; // modify field
+    std::println("Updated shape name: {}", *(shapes[0].name));
 }

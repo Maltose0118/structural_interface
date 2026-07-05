@@ -132,6 +132,14 @@ struct rebind_member_pointer<M C::*, Owner> {
     using type = M Owner::*;
 };
 
+template <class Ptr>
+struct member_object_type;
+
+template <class M, class C>
+struct member_object_type<M C::*> {
+    using type = M;
+};
+
 #define SI_REBIND_MEMBER_FUNCTION(CV, REF, NOEXCEPT_SPEC)                       \
     template <class R, class C, class... Args, class Owner>                     \
     struct rebind_member_pointer<R (C::*)(Args...) CV REF NOEXCEPT_SPEC, Owner> { \
@@ -193,6 +201,9 @@ concrete_member_pointer() {
     return std::meta::extract<concrete_pointer>(member);
 }
 
+template <class Owner>
+void** object_slot(Owner& owner) noexcept;
+
 #define SI_FUNCTION_PROXY(CV, REF, NOEXCEPT_SPEC, OBJECT_EXPR)                  \
     template <class Owner, auto InterfaceMember, class I, class R, class... Args> \
     struct function_proxy<Owner, InterfaceMember, R (I::*)(Args...) CV REF NOEXCEPT_SPEC> { \
@@ -215,12 +226,12 @@ concrete_member_pointer() {
                                                                                 \
         template <class T>                                                      \
         void bind(Owner& new_owner) noexcept {                                  \
-            object = new_owner._si_object_slot_();                              \
+            object = object_slot(new_owner);                                    \
             call = thunk_for<T>();                                              \
         }                                                                       \
                                                                                 \
         void rebind_from(const function_proxy& other, Owner& new_owner) noexcept { \
-            object = new_owner._si_object_slot_();                              \
+            object = object_slot(new_owner);                                    \
             call = other.call;                                                  \
         }                                                                       \
                                                                                 \
@@ -265,6 +276,12 @@ SI_FUNCTION_PROXY(const volatile, &&, noexcept, SI_PROXY_OBJECT_RVALUE)
 #undef SI_PROXY_OBJECT_LVALUE
 #undef SI_FUNCTION_PROXY
 
+template <auto InterfaceMember, class T>
+void* concrete_field_address(void* object) noexcept {
+    constexpr auto member = concrete_member_pointer<InterfaceMember, T>();
+    return std::addressof(static_cast<T*>(object)->*member);
+}
+
 template <class Owner, class I>
 struct generated_function_members {
     struct type;
@@ -280,6 +297,12 @@ struct generated_function_members {
                 specs.push_back(std::meta::data_member_spec(
                     ^^proxy_type,
                     {.name = std::string(std::meta::identifier_of(member))}));
+            } else if constexpr (std::meta::is_nonstatic_data_member(member)) {
+                using proxy_type = member_pointer_type_t<member>;
+                using field_type = typename member_object_type<proxy_type>::type;
+                specs.push_back(std::meta::data_member_spec(
+                    ^^field_type*,
+                    {.name = std::string(std::meta::identifier_of(member))}));
             }
         }
         std::meta::define_aggregate(^^type, specs);
@@ -288,6 +311,11 @@ struct generated_function_members {
 
 template <class Owner, class I>
 using generated_function_members_t = typename generated_function_members<Owner, I>::type;
+
+template <class Owner>
+void** object_slot(Owner& owner) noexcept {
+    return &owner._si_details_.object;
+}
 
 template <class Generated, auto InterfaceMember, class Proxy>
 consteval auto generated_proxy_member() {
@@ -306,7 +334,7 @@ consteval auto generated_proxy_member() {
 }
 
 template <class Owner, class I, class T>
-void bind_function_members(Owner& owner) noexcept {
+void bind_member_proxies(Owner& owner) noexcept {
     template for (constexpr auto member : [: reflected_members(^^I) :]) {
         if constexpr (std::meta::is_function(member) &&
                       !std::meta::is_special_member_function(member) &&
@@ -316,12 +344,19 @@ void bind_function_members(Owner& owner) noexcept {
             constexpr auto base_member =
                 generated_proxy_member<generated_function_members_t<Owner, I>, member, proxy_type>();
             (owner.*base_member).template bind<T>(owner);
+        } else if constexpr (std::meta::is_nonstatic_data_member(member)) {
+            using proxy_type = member_pointer_type_t<member>;
+            using field_type = typename member_object_type<proxy_type>::type;
+            constexpr auto base_member =
+                generated_proxy_member<generated_function_members_t<Owner, I>, member, field_type*>();
+            owner.*base_member =
+                static_cast<field_type*>(concrete_field_address<member, T>(*object_slot(owner)));
         }
     }
 }
 
 template <class Owner, class I>
-void copy_function_members(Owner& owner, const Owner& other) noexcept {
+void copy_member_proxies(Owner& owner, const Owner& other) noexcept {
     template for (constexpr auto member : [: reflected_members(^^I) :]) {
         if constexpr (std::meta::is_function(member) &&
                       !std::meta::is_special_member_function(member) &&
@@ -331,6 +366,16 @@ void copy_function_members(Owner& owner, const Owner& other) noexcept {
             constexpr auto base_member =
                 generated_proxy_member<generated_function_members_t<Owner, I>, member, proxy_type>();
             (owner.*base_member).rebind_from(other.*base_member, owner);
+        } else if constexpr (std::meta::is_nonstatic_data_member(member)) {
+            using proxy_type = member_pointer_type_t<member>;
+            using field_type = typename member_object_type<proxy_type>::type;
+            constexpr auto base_member =
+                generated_proxy_member<generated_function_members_t<Owner, I>, member, field_type*>();
+            auto* other_object = static_cast<std::byte*>(other._si_details_.object);
+            auto* other_field = reinterpret_cast<std::byte*>(other.*base_member);
+            auto offset = other_field - other_object;
+            owner.*base_member = reinterpret_cast<field_type*>(
+                static_cast<std::byte*>(*object_slot(owner)) + offset);
         }
     }
 }
@@ -498,7 +543,7 @@ inline const interface_metadata<I> metadata_for = {
     .type_token = &metadata_for<I, T>,
 };
 
-template <class I>
+template <class I, class Owner>
 struct _si_existential_details {
     alignas(sbo_storage_alignment) std::byte storage[sbo_storage_size]{};
     void* object = nullptr;
@@ -544,9 +589,34 @@ struct _si_existential_details {
             other.metadata = nullptr;
         }
     }
+
+    template <class T, class... Args>
+    void construct_value(Owner& owner, Args&&... args) {
+        using concrete = std::remove_cvref_t<T>;
+        emplace<concrete>(std::forward<Args>(args)...);
+        bind_member_proxies<Owner, I, concrete>(owner);
+    }
+
+    void move_value_from(Owner& owner, Owner& other) noexcept {
+        if (!other._si_details_.has_object()) {
+            return;
+        }
+        metadata = other._si_details_.metadata;
+        if (other._si_details_.object == other._si_details_.storage) {
+            other._si_details_.metadata->move_construct(storage, &object, other._si_details_.object);
+            copy_member_proxies<Owner, I>(owner, other);
+            other._si_details_.destroy();
+            return;
+        }
+
+        object = other._si_details_.object;
+        copy_member_proxies<Owner, I>(owner, other);
+        other._si_details_.object = nullptr;
+        other._si_details_.metadata = nullptr;
+    }
 };
 
-template <class I>
+template <class I, class Owner>
 struct _si_ref_details {
     void* object = nullptr;
     const interface_metadata<I>* metadata = nullptr;
@@ -577,16 +647,16 @@ public:
                  std::copy_constructible<std::remove_cvref_t<T>> &&
                  std::move_constructible<std::remove_cvref_t<T>>
     existential(T&& value) {
-        emplace<std::remove_cvref_t<T>>(std::forward<T>(value));
+        _si_details_.template construct_value<std::remove_cvref_t<T>>(*this, std::forward<T>(value));
     }
 
     existential(const existential& other) {
         _si_details_.copy_from(other._si_details_);
-        detail::copy_function_members<existential, I>(*this, other);
+        detail::copy_member_proxies<existential, I>(*this, other);
     }
 
     existential(existential&& other) noexcept {
-        move_from(std::move(other));
+        _si_details_.move_value_from(*this, other);
     }
 
     existential& operator=(const existential& other) {
@@ -595,7 +665,7 @@ public:
         }
         _si_details_.destroy();
         _si_details_.copy_from(other._si_details_);
-        detail::copy_function_members<existential, I>(*this, other);
+        detail::copy_member_proxies<existential, I>(*this, other);
         return *this;
     }
 
@@ -604,7 +674,7 @@ public:
             return *this;
         }
         _si_details_.destroy();
-        move_from(std::move(other));
+        _si_details_.move_value_from(*this, other);
         return *this;
     }
 
@@ -613,29 +683,18 @@ public:
     }
 
 private:
+    template <class, class>
+    friend struct detail::_si_existential_details;
+    template <class Owner>
+    friend void** detail::object_slot(Owner&) noexcept;
     template <class, auto, class>
     friend struct detail::function_proxy;
+    template <class Owner, class Interface, class T>
+    friend void detail::bind_member_proxies(Owner&) noexcept;
+    template <class Owner, class Interface>
+    friend void detail::copy_member_proxies(Owner&, const Owner&) noexcept;
 
-    void** _si_object_slot_() noexcept {
-        return &_si_details_.object;
-    }
-
-    template <class T, class... Args>
-    void emplace(Args&&... args) {
-        using concrete = std::remove_cvref_t<T>;
-        _si_details_.template emplace<concrete>(std::forward<Args>(args)...);
-        detail::bind_function_members<existential, I, concrete>(*this);
-    }
-
-    void move_from(existential&& other) noexcept {
-        if (!other._si_details_.has_object()) {
-            return;
-        }
-        _si_details_.move_from(other._si_details_);
-        detail::copy_function_members<existential, I>(*this, other);
-    }
-
-    detail::_si_existential_details<I> _si_details_;
+    detail::_si_existential_details<I, existential<I>> _si_details_;
 };
 
 template <class I>
@@ -646,14 +705,14 @@ public:
                  satisfies<std::remove_cvref_t<T>, I> &&
                  std::move_constructible<std::remove_cvref_t<T>>
     existential_move_only(T&& value) {
-        emplace<std::remove_cvref_t<T>>(std::forward<T>(value));
+        _si_details_.template construct_value<std::remove_cvref_t<T>>(*this, std::forward<T>(value));
     }
 
     existential_move_only(const existential_move_only&) = delete;
     existential_move_only& operator=(const existential_move_only&) = delete;
 
     existential_move_only(existential_move_only&& other) noexcept {
-        move_from(std::move(other));
+        _si_details_.move_value_from(*this, other);
     }
 
     existential_move_only& operator=(existential_move_only&& other) noexcept {
@@ -661,7 +720,7 @@ public:
             return *this;
         }
         _si_details_.destroy();
-        move_from(std::move(other));
+        _si_details_.move_value_from(*this, other);
         return *this;
     }
 
@@ -670,29 +729,18 @@ public:
     }
 
 private:
+    template <class, class>
+    friend struct detail::_si_existential_details;
+    template <class Owner>
+    friend void** detail::object_slot(Owner&) noexcept;
     template <class, auto, class>
     friend struct detail::function_proxy;
+    template <class Owner, class Interface, class T>
+    friend void detail::bind_member_proxies(Owner&) noexcept;
+    template <class Owner, class Interface>
+    friend void detail::copy_member_proxies(Owner&, const Owner&) noexcept;
 
-    void** _si_object_slot_() noexcept {
-        return &_si_details_.object;
-    }
-
-    template <class T, class... Args>
-    void emplace(Args&&... args) {
-        using concrete = std::remove_cvref_t<T>;
-        _si_details_.template emplace<concrete>(std::forward<Args>(args)...);
-        detail::bind_function_members<existential_move_only, I, concrete>(*this);
-    }
-
-    void move_from(existential_move_only&& other) noexcept {
-        if (!other._si_details_.has_object()) {
-            return;
-        }
-        _si_details_.move_from(other._si_details_);
-        detail::copy_function_members<existential_move_only, I>(*this, other);
-    }
-
-    detail::_si_existential_details<I> _si_details_;
+    detail::_si_existential_details<I, existential_move_only<I>> _si_details_;
 };
 
 template <class I>
@@ -702,18 +750,18 @@ public:
         requires satisfies<std::remove_cvref_t<T>, I>
     existential_ref(T& value) noexcept {
         _si_details_.bind(value);
-        detail::bind_function_members<existential_ref, I, std::remove_cvref_t<T>>(*this);
+        detail::bind_member_proxies<existential_ref, I, std::remove_cvref_t<T>>(*this);
     }
 
 private:
     template <class, auto, class>
     friend struct detail::function_proxy;
+    template <class Owner>
+    friend void** detail::object_slot(Owner&) noexcept;
+    template <class Owner, class Interface, class T>
+    friend void detail::bind_member_proxies(Owner&) noexcept;
 
-    void** _si_object_slot_() noexcept {
-        return &_si_details_.object;
-    }
-
-    detail::_si_ref_details<I> _si_details_;
+    detail::_si_ref_details<I, existential_ref<I>> _si_details_;
 };
 
 } // namespace si

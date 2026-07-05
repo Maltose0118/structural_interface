@@ -147,8 +147,23 @@ int main() {
 
     "owning existential exposes reflected call members"_test = [] {
         si::existential<MutableCounter> counter = Circle{};
-        expect(counter.bump(3) == 3_i);
-        expect(counter.bump(4) == 7_i);
+        static_assert(std::same_as<decltype(counter.value), int*>);
+        expect(*counter.value == 0_i);
+        *counter.value = 10;
+        expect(*counter.value == 10_i);
+        expect(counter.bump(3) == 13_i);
+        expect(*counter.value == 13_i);
+        expect(counter.bump(4) == 17_i);
+
+        auto copied = counter;
+        *copied.value = 100;
+        expect(*copied.value == 100_i);
+        expect(*counter.value == 17_i);
+
+        auto moved = std::move(counter);
+        expect(*moved.value == 17_i);
+        *moved.value = 23;
+        expect(moved.bump(1) == 24_i);
     };
 
     "multi-argument calls keep argument and return types"_test = [] {
@@ -181,7 +196,12 @@ int main() {
 
     "reference existential observes an object"_test = [] {
         Circle circle{};
-        si::existential_ref<Drawable> ref = circle;
-        ref.draw();
+        si::existential_ref<MutableCounter> ref = circle;
+        *ref.value = 41;
+        expect(circle.value == 41_i);
+        expect(ref.bump(1) == 42_i);
+        expect(*ref.value == 42_i);
+        si::existential_ref<Drawable> drawable_ref = circle;
+        drawable_ref.draw();
     };
 }
