@@ -4,48 +4,123 @@ Structural Interface (SI) is a C++26 static-reflection-based, header-only experi
 
 ## Quick Example
 
+### Step 1: Non-intrusive dynamic dispatch
+
+Define an interface as a plain `struct`. Any type satisfying it can be type-erased into an `existential` and dispatched dynamically:
+
 ```cpp
-// interface
-struct Shape {
-    std::string name;   // field member
-    float area() const; // function member
+#include <structural_interface.hpp>
+
+// Define an interface: a struct with the required members
+struct Drawable {
+    void draw() const;
 };
 
-// unified function that accepts any type satisfying the Shape interface
-float area(const si::satisfies<Shape> auto& shape) {
-    return shape.area();
+// Concrete types that satisfy the Drawable interface
+struct Circle {
+    void draw() const { std::println("Circle"); }
+};
+
+struct Rectangle {
+    void draw() const { std::println("Rectangle"); }
+};
+
+static_assert(si::satisfies<Circle, Drawable>);
+static_assert(si::satisfies<Rectangle, Drawable>);
+
+int main() {
+    // Type-erased container: any type satisfying Drawable is accepted
+    std::vector<si::existential<Drawable>> shapes{ Circle{}, Rectangle{} };
+
+    for (const auto& shape : shapes) {
+        shape.draw(); // dynamic dispatch
+    }
+}
+```
+
+No macros, no base class inheritance, no code generators required — just C++26.
+
+### Step 2: One algorithm, both static and dynamic dispatch
+
+Write a single generic function that satisfies `si::satisfies<Drawable> auto` — it works with concrete types (static dispatch) and existential wrappers (dynamic dispatch) alike:
+
+```cpp
+// A single algorithm that works with both static and dynamic dispatch
+void render(const si::satisfies<Drawable> auto& obj) {
+    obj.draw();
 }
 
-// custom types that satisfy the Shape interface
+int main() {
+    Circle circle{};
+    render(circle); // static dispatch, zero overhead
+
+    si::existential<Drawable> obj = Rectangle{};
+    render(obj);    // dynamic dispatch, same function
+}
+```
+
+One interface, one algorithm, two dispatch modes.
+
+### Step 3: Interface composition
+
+Interfaces can inherit multiple parent interfaces. A composed interface requires satisfying all of them simultaneously (`Widget = Drawable ∩ Scalable`):
+
+```cpp
+struct Drawable {
+    void draw() const;
+};
+
+struct Scalable {
+    void scale(float factor);
+};
+
+// Composed interface = Drawable + Scalable
+struct Widget : Drawable, Scalable {};
+
+// A concrete type that satisfies both Drawable and Scalable
+struct Button {
+    void draw() const { std::println("Button"); }
+    void scale(float factor) { std::println("  scaled by {}", factor); }
+};
+
+static_assert(si::satisfies<Button, Widget>);
+
+int main() {
+    std::vector<si::existential<Widget>> widgets{ Button{} };
+    for (const auto& w : widgets) {
+        w.draw();
+        w.scale(2.0f);
+    }
+}
+```
+
+### Step 4: Interfaces with data members
+
+Interfaces can declare data members too. Extend `Drawable` with a `name` field, and runtime wrappers expose it as a raw field pointer (`*(obj.field)`):
+
+```cpp
+struct Drawable {
+    std::string name; // data member
+    void draw() const; // function member
+};
+
 struct Circle {
     std::string name;
-    float radius{ 0.0f };
-
-    float area() const {
-        return 3.14159f * radius * radius;
-    }
+    void draw() const { std::println("{}", name); }
 };
+
 struct Rectangle {
     std::string name;
-    float width{ 0.0f };
-    float height{ 0.0f };
-
-    float area() const {
-        return width * height;
-    }
+    void draw() const { std::println("{}", name); }
 };
 
 int main() {
-    Circle circle{ "Circle", 5.0f };
-    std::println("Circle area: {}", area(circle)); // static dispatch
-
-    std::vector<si::existential<Shape>> shapes{ Circle{ "Circle", 3.0f }, Rectangle{ "Rectangle", 4.0f, 6.0f } };
+    std::vector<si::existential<Drawable>> shapes{ Circle{ "circle" }, Rectangle{ "rect" } };
     for (const auto& shape : shapes) {
-        std::println("Shape {} area: {}", *(shape.name), shape.area()); // dynamic dispatch
+        // shape.name has type std::string*, not std::string
+        std::println("{}:", *(shape.name));
+        shape.draw();
     }
-
-    *(shapes[0].name) = "Updated Circle"; // modify field
-    std::println("Updated shape name: {}", *(shapes[0].name));
 }
 ```
 
@@ -56,19 +131,15 @@ The full example can be found at [examples/basic.cpp](examples/basic.cpp).
 SI describes **syntactic interfaces**: what members a type publicly exposes, without constraining their semantics.
 
 ```cpp
-struct Shape {
-    float area() const;
+struct Drawable {
+    void draw() const;
 };
 
 struct Circle {
-    float radius{};
-
-    float area() const {
-        return 3.14159f * radius * radius;
-    }
+    void draw() const { std::println("Circle"); }
 };
 
-static_assert(si::satisfies<Circle, Shape>);
+static_assert(si::satisfies<Circle, Drawable>);
 ```
 
 Interface definitions require **no macros, no inheritance from special base classes, and no external code generators**.
