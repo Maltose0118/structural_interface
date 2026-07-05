@@ -1,4 +1,5 @@
 .agents
+.workbuddy
 .xmake/
 build/
 *:Zone.Identifier
