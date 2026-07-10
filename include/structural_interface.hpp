@@ -22,8 +22,8 @@ class existential_move_only;
 template <class I>
 class existential_ref;
 
-inline constexpr std::size_t sbo_storage_size = 64;
-inline constexpr std::size_t sbo_storage_alignment = alignof(std::max_align_t);
+inline constexpr std::size_t sbo_storage_size = sizeof(void*) * 2;
+inline constexpr std::size_t sbo_storage_alignment = alignof(void*);
 
 namespace detail {
 
