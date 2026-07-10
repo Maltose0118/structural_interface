@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -41,24 +42,59 @@ struct StepInterface {
     std::uint64_t step(std::uint64_t input) noexcept;
 };
 
+struct MultiStepInterface {
+    std::uint64_t step(std::uint64_t input) noexcept;
+    std::uint64_t mix(std::uint64_t left, std::uint64_t right) noexcept;
+    std::uint64_t read() const noexcept;
+};
+
+struct FieldInterface {
+    std::uint64_t value;
+};
+
 struct VirtualStep {
     virtual ~VirtualStep() = default;
     virtual std::uint64_t step(std::uint64_t input) noexcept = 0;
 };
 
+struct VirtualMultiStep {
+    virtual ~VirtualMultiStep() = default;
+    virtual std::uint64_t step(std::uint64_t input) noexcept = 0;
+    virtual std::uint64_t mix(std::uint64_t left, std::uint64_t right) noexcept = 0;
+    virtual std::uint64_t read() const noexcept = 0;
+};
+
+struct VirtualField {
+    virtual ~VirtualField() = default;
+    virtual std::uint64_t& value_ref() noexcept = 0;
+};
+
 template <int Id, std::size_t PayloadBytes>
 struct Model {
     payload_for<PayloadBytes> payload{};
-    std::uint64_t state = static_cast<std::uint64_t>(Id + 1);
+    std::uint64_t value = static_cast<std::uint64_t>(Id + 1);
 
     std::uint64_t step(std::uint64_t input) noexcept {
-        state = state * 1'103'515'245u + input + static_cast<std::uint64_t>(Id + 12'345);
-        return state ^ (state >> ((Id % 13) + 1));
+        value = value * 1'103'515'245u + input + static_cast<std::uint64_t>(Id + 12'345);
+        return value ^ (value >> ((Id % 13) + 1));
+    }
+
+    std::uint64_t mix(std::uint64_t left, std::uint64_t right) noexcept {
+        value += (left * static_cast<std::uint64_t>(Id + 3)) ^ (right + 0x9e3779b97f4a7c15ull);
+        return value;
+    }
+
+    std::uint64_t read() const noexcept {
+        return value;
+    }
+
+    std::uint64_t& value_ref() noexcept {
+        return value;
     }
 };
 
 template <int Id, std::size_t PayloadBytes>
-struct VirtualModel final : VirtualStep {
+struct VirtualStepModel final : VirtualStep {
     Model<Id, PayloadBytes> model{};
 
     std::uint64_t step(std::uint64_t input) noexcept override {
@@ -66,10 +102,51 @@ struct VirtualModel final : VirtualStep {
     }
 };
 
+template <int Id, std::size_t PayloadBytes>
+struct VirtualMultiStepModel final : VirtualMultiStep {
+    Model<Id, PayloadBytes> model{};
+
+    std::uint64_t step(std::uint64_t input) noexcept override {
+        return model.step(input);
+    }
+
+    std::uint64_t mix(std::uint64_t left, std::uint64_t right) noexcept override {
+        return model.mix(left, right);
+    }
+
+    std::uint64_t read() const noexcept override {
+        return model.read();
+    }
+};
+
+template <int Id, std::size_t PayloadBytes>
+struct VirtualFieldModel final : VirtualField {
+    Model<Id, PayloadBytes> model{};
+
+    std::uint64_t& value_ref() noexcept override {
+        return model.value_ref();
+    }
+};
+
 PRO_DEF_MEM_DISPATCH(MemStep, step);
+PRO_DEF_MEM_DISPATCH(MemMix, mix);
+PRO_DEF_MEM_DISPATCH(MemRead, read);
+PRO_DEF_MEM_DISPATCH(MemValueRef, value_ref);
 
 struct ProxyStep : pro::facade_builder
     ::add_convention<MemStep, std::uint64_t(std::uint64_t) noexcept>
+    ::support_copy<pro::constraint_level::nontrivial>
+    ::build {};
+
+struct ProxyMultiStep : pro::facade_builder
+    ::add_convention<MemStep, std::uint64_t(std::uint64_t) noexcept>
+    ::add_convention<MemMix, std::uint64_t(std::uint64_t, std::uint64_t) noexcept>
+    ::add_convention<MemRead, std::uint64_t() const noexcept>
+    ::support_copy<pro::constraint_level::nontrivial>
+    ::build {};
+
+struct ProxyField : pro::facade_builder
+    ::add_convention<MemValueRef, std::uint64_t&() noexcept>
     ::support_copy<pro::constraint_level::nontrivial>
     ::build {};
 
@@ -91,9 +168,9 @@ decltype(auto) with_type_index(std::size_t index, Fn&& fn) {
                            std::make_index_sequence<concrete_type_count>{});
 }
 
-template <std::size_t PayloadBytes>
-std::vector<std::unique_ptr<VirtualStep>> make_virtual_objects(std::size_t object_count) {
-    std::vector<std::unique_ptr<VirtualStep>> objects;
+template <class VirtualBase, template <int, std::size_t> class VirtualModel, std::size_t PayloadBytes>
+std::vector<std::unique_ptr<VirtualBase>> make_virtual_objects(std::size_t object_count) {
+    std::vector<std::unique_ptr<VirtualBase>> objects;
     objects.reserve(object_count);
     for (std::size_t index = 0; index != object_count; ++index) {
         with_type_index(index, [&]<int Id> {
@@ -103,9 +180,9 @@ std::vector<std::unique_ptr<VirtualStep>> make_virtual_objects(std::size_t objec
     return objects;
 }
 
-template <std::size_t PayloadBytes>
-std::vector<si::existential_move_only<StepInterface>> make_si_objects(std::size_t object_count) {
-    std::vector<si::existential_move_only<StepInterface>> objects;
+template <class Interface, std::size_t PayloadBytes>
+std::vector<si::existential_move_only<Interface>> make_si_objects(std::size_t object_count) {
+    std::vector<si::existential_move_only<Interface>> objects;
     objects.reserve(object_count);
     for (std::size_t index = 0; index != object_count; ++index) {
         with_type_index(index, [&]<int Id> {
@@ -115,23 +192,23 @@ std::vector<si::existential_move_only<StepInterface>> make_si_objects(std::size_
     return objects;
 }
 
-template <std::size_t PayloadBytes>
-std::vector<pro::proxy<ProxyStep>> make_proxy_objects(std::size_t object_count) {
-    std::vector<pro::proxy<ProxyStep>> objects;
+template <class Facade, std::size_t PayloadBytes>
+std::vector<pro::proxy<Facade>> make_proxy_objects(std::size_t object_count) {
+    std::vector<pro::proxy<Facade>> objects;
     objects.reserve(object_count);
     for (std::size_t index = 0; index != object_count; ++index) {
         with_type_index(index, [&]<int Id> {
-            objects.emplace_back(pro::make_proxy<ProxyStep, Model<Id, PayloadBytes>>());
+            objects.emplace_back(pro::make_proxy<Facade, Model<Id, PayloadBytes>>());
         });
     }
     return objects;
 }
 
 template <class Objects, class Call>
-void run_invocation_bench(ankerl::nanobench::Bench& bench,
-                          std::string_view name,
-                          Objects& objects,
-                          Call&& call) {
+void run_bench(ankerl::nanobench::Bench& bench,
+               std::string_view name,
+               Objects& objects,
+               Call&& call) {
     bench.batch(objects.size()).run(std::string{name}, [&] {
         std::uint64_t checksum = 0;
         std::uint64_t input = 0;
@@ -140,32 +217,6 @@ void run_invocation_bench(ankerl::nanobench::Bench& bench,
         }
         ankerl::nanobench::doNotOptimizeAway(checksum);
     });
-}
-
-template <std::size_t PayloadBytes>
-void run_invocation_group(ankerl::nanobench::Bench& bench,
-                          std::string_view label,
-                          std::size_t object_count) {
-    auto virtual_objects = make_virtual_objects<PayloadBytes>(object_count);
-    run_invocation_bench(bench, std::string{"virtual/invoke/"} + std::string{label},
-                         virtual_objects,
-                         [](auto& object, std::uint64_t input) noexcept {
-                             return object->step(input);
-                         });
-
-    auto si_objects = make_si_objects<PayloadBytes>(object_count);
-    run_invocation_bench(bench, std::string{"si/invoke/"} + std::string{label},
-                         si_objects,
-                         [](auto& object, std::uint64_t input) noexcept {
-                             return object.step(input);
-                         });
-
-    auto proxy_objects = make_proxy_objects<PayloadBytes>(object_count);
-    run_invocation_bench(bench, std::string{"proxy/invoke/"} + std::string{label},
-                         proxy_objects,
-                         [](auto& object, std::uint64_t input) noexcept {
-                             return object->step(input);
-                         });
 }
 
 template <class MakeObjects>
@@ -180,15 +231,103 @@ void run_lifetime_bench(ankerl::nanobench::Bench& bench,
 }
 
 template <std::size_t PayloadBytes>
+void run_single_function_group(ankerl::nanobench::Bench& bench,
+                               std::string_view label,
+                               std::size_t object_count) {
+    auto virtual_objects =
+        make_virtual_objects<VirtualStep, VirtualStepModel, PayloadBytes>(object_count);
+    run_bench(bench, std::string{label} + "/single/virtual", virtual_objects,
+              [](auto& object, std::uint64_t input) noexcept {
+                  return object->step(input);
+              });
+
+    auto si_objects = make_si_objects<StepInterface, PayloadBytes>(object_count);
+    run_bench(bench, std::string{label} + "/single/si", si_objects,
+              [](auto& object, std::uint64_t input) noexcept {
+                  return object.step(input);
+              });
+
+    auto proxy_objects = make_proxy_objects<ProxyStep, PayloadBytes>(object_count);
+    run_bench(bench, std::string{label} + "/single/proxy", proxy_objects,
+              [](auto& object, std::uint64_t input) noexcept {
+                  return object->step(input);
+              });
+}
+
+template <std::size_t PayloadBytes>
+void run_multi_function_group(ankerl::nanobench::Bench& bench,
+                              std::string_view label,
+                              std::size_t object_count) {
+    auto virtual_objects =
+        make_virtual_objects<VirtualMultiStep, VirtualMultiStepModel, PayloadBytes>(object_count);
+    run_bench(bench, std::string{label} + "/multi/virtual", virtual_objects,
+              [](auto& object, std::uint64_t input) noexcept {
+                  return object->step(input) ^ object->mix(input, input + 7) ^ object->read();
+              });
+
+    auto si_objects = make_si_objects<MultiStepInterface, PayloadBytes>(object_count);
+    run_bench(bench, std::string{label} + "/multi/si", si_objects,
+              [](auto& object, std::uint64_t input) noexcept {
+                  return object.step(input) ^ object.mix(input, input + 7) ^ object.read();
+              });
+
+    auto proxy_objects = make_proxy_objects<ProxyMultiStep, PayloadBytes>(object_count);
+    run_bench(bench, std::string{label} + "/multi/proxy", proxy_objects,
+              [](auto& object, std::uint64_t input) noexcept {
+                  return object->step(input) ^ object->mix(input, input + 7) ^ object->read();
+              });
+}
+
+template <std::size_t PayloadBytes>
+void run_field_group(ankerl::nanobench::Bench& bench,
+                     std::string_view label,
+                     std::size_t object_count) {
+    auto virtual_objects =
+        make_virtual_objects<VirtualField, VirtualFieldModel, PayloadBytes>(object_count);
+    run_bench(bench, std::string{label} + "/field/virtual-ref", virtual_objects,
+              [](auto& object, std::uint64_t input) noexcept {
+                  auto& value = object->value_ref();
+                  value += input;
+                  return value;
+              });
+
+    auto si_objects = make_si_objects<FieldInterface, PayloadBytes>(object_count);
+    run_bench(bench, std::string{label} + "/field/si-data-member", si_objects,
+              [](auto& object, std::uint64_t input) noexcept {
+                  *object.value += input;
+                  return *object.value;
+              });
+
+    auto proxy_objects = make_proxy_objects<ProxyField, PayloadBytes>(object_count);
+    run_bench(bench, std::string{label} + "/field/proxy-ref", proxy_objects,
+              [](auto& object, std::uint64_t input) noexcept {
+                  auto& value = object->value_ref();
+                  value += input;
+                  return value;
+              });
+}
+
+template <std::size_t PayloadBytes>
 void run_lifetime_group(ankerl::nanobench::Bench& bench,
                         std::string_view label,
                         std::size_t object_count) {
-    run_lifetime_bench(bench, std::string{"virtual/lifetime/"} + std::string{label},
-                       object_count, make_virtual_objects<PayloadBytes>);
-    run_lifetime_bench(bench, std::string{"si/lifetime/"} + std::string{label},
-                       object_count, make_si_objects<PayloadBytes>);
-    run_lifetime_bench(bench, std::string{"proxy/lifetime/"} + std::string{label},
-                       object_count, make_proxy_objects<PayloadBytes>);
+    run_lifetime_bench(bench, std::string{label} + "/lifetime/virtual",
+                       object_count,
+                       make_virtual_objects<VirtualStep, VirtualStepModel, PayloadBytes>);
+    run_lifetime_bench(bench, std::string{label} + "/lifetime/si",
+                       object_count, make_si_objects<StepInterface, PayloadBytes>);
+    run_lifetime_bench(bench, std::string{label} + "/lifetime/proxy",
+                       object_count, make_proxy_objects<ProxyStep, PayloadBytes>);
+}
+
+template <std::size_t PayloadBytes>
+void run_payload_groups(ankerl::nanobench::Bench& bench,
+                        std::string_view label,
+                        std::size_t object_count) {
+    run_single_function_group<PayloadBytes>(bench, label, object_count);
+    run_multi_function_group<PayloadBytes>(bench, label, object_count);
+    run_field_group<PayloadBytes>(bench, label, object_count);
+    run_lifetime_group<PayloadBytes>(bench, label, object_count);
 }
 
 } // namespace
@@ -203,8 +342,6 @@ int main(int argc, char** argv) {
         .minEpochIterations(20)
         .relative(true);
 
-    run_invocation_group<4>(bench, "small-4B", object_count);
-    run_invocation_group<96>(bench, "large-96B", object_count);
-    run_lifetime_group<4>(bench, "small-4B", object_count);
-    run_lifetime_group<96>(bench, "large-96B", object_count);
+    run_payload_groups<4>(bench, "small-4B", object_count);
+    run_payload_groups<96>(bench, "large-96B", object_count);
 }
