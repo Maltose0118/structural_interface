@@ -5,6 +5,7 @@
 #include <structural_interface.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -16,7 +17,9 @@
 
 namespace {
 
-constexpr std::size_t concrete_type_count = 100;
+// Keep enough concrete types to exercise heterogeneous storage without making
+// this translation unit dominated by template instantiation.
+constexpr std::size_t concrete_type_count = 8;
 constexpr std::size_t default_object_count = 100'000;
 
 std::size_t parse_object_count(int argc, char** argv) {
@@ -51,17 +54,6 @@ struct FieldInterface {
     std::uint64_t value;
 };
 
-struct ManyFieldsInterface {
-    std::uint16_t value0;
-    std::uint16_t value1;
-    std::uint16_t value2;
-    std::uint16_t value3;
-    std::uint16_t value4;
-    std::uint16_t value5;
-    std::uint16_t value6;
-    std::uint16_t value7;
-};
-
 struct VirtualStep {
     virtual ~VirtualStep() = default;
     virtual std::uint64_t step(std::uint64_t input) noexcept = 0;
@@ -77,18 +69,6 @@ struct VirtualMultiStep {
 struct VirtualField {
     virtual ~VirtualField() = default;
     virtual std::uint64_t& value_ref() noexcept = 0;
-};
-
-struct VirtualManyFields {
-    virtual ~VirtualManyFields() = default;
-    virtual std::uint16_t& value0_ref() noexcept = 0;
-    virtual std::uint16_t& value1_ref() noexcept = 0;
-    virtual std::uint16_t& value2_ref() noexcept = 0;
-    virtual std::uint16_t& value3_ref() noexcept = 0;
-    virtual std::uint16_t& value4_ref() noexcept = 0;
-    virtual std::uint16_t& value5_ref() noexcept = 0;
-    virtual std::uint16_t& value6_ref() noexcept = 0;
-    virtual std::uint16_t& value7_ref() noexcept = 0;
 };
 
 template <int Id, std::size_t ObjectBytes>
@@ -113,29 +93,6 @@ struct Model {
     std::uint64_t& value_ref() noexcept {
         return value;
     }
-};
-
-template <int Id, std::size_t ObjectBytes>
-struct ManyFieldsModel {
-    static_assert(ObjectBytes >= sizeof(std::uint16_t) * 8);
-    [[no_unique_address]] padding_for<ObjectBytes, sizeof(std::uint16_t) * 8> payload{};
-    std::uint16_t value0 = static_cast<std::uint16_t>(Id + 1);
-    std::uint16_t value1 = static_cast<std::uint16_t>(Id + 2);
-    std::uint16_t value2 = static_cast<std::uint16_t>(Id + 3);
-    std::uint16_t value3 = static_cast<std::uint16_t>(Id + 4);
-    std::uint16_t value4 = static_cast<std::uint16_t>(Id + 5);
-    std::uint16_t value5 = static_cast<std::uint16_t>(Id + 6);
-    std::uint16_t value6 = static_cast<std::uint16_t>(Id + 7);
-    std::uint16_t value7 = static_cast<std::uint16_t>(Id + 8);
-
-    std::uint16_t& value0_ref() noexcept { return value0; }
-    std::uint16_t& value1_ref() noexcept { return value1; }
-    std::uint16_t& value2_ref() noexcept { return value2; }
-    std::uint16_t& value3_ref() noexcept { return value3; }
-    std::uint16_t& value4_ref() noexcept { return value4; }
-    std::uint16_t& value5_ref() noexcept { return value5; }
-    std::uint16_t& value6_ref() noexcept { return value6; }
-    std::uint16_t& value7_ref() noexcept { return value7; }
 };
 
 template <int Id, std::size_t PayloadBytes>
@@ -173,32 +130,10 @@ struct VirtualFieldModel final : VirtualField {
     }
 };
 
-template <int Id, std::size_t PayloadBytes>
-struct VirtualManyFieldsModel final : VirtualManyFields {
-    ManyFieldsModel<Id, PayloadBytes> model{};
-
-    std::uint16_t& value0_ref() noexcept override { return model.value0_ref(); }
-    std::uint16_t& value1_ref() noexcept override { return model.value1_ref(); }
-    std::uint16_t& value2_ref() noexcept override { return model.value2_ref(); }
-    std::uint16_t& value3_ref() noexcept override { return model.value3_ref(); }
-    std::uint16_t& value4_ref() noexcept override { return model.value4_ref(); }
-    std::uint16_t& value5_ref() noexcept override { return model.value5_ref(); }
-    std::uint16_t& value6_ref() noexcept override { return model.value6_ref(); }
-    std::uint16_t& value7_ref() noexcept override { return model.value7_ref(); }
-};
-
 PRO_DEF_MEM_DISPATCH(MemStep, step);
 PRO_DEF_MEM_DISPATCH(MemMix, mix);
 PRO_DEF_MEM_DISPATCH(MemRead, read);
 PRO_DEF_MEM_DISPATCH(MemValueRef, value_ref);
-PRO_DEF_MEM_DISPATCH(MemValue0Ref, value0_ref);
-PRO_DEF_MEM_DISPATCH(MemValue1Ref, value1_ref);
-PRO_DEF_MEM_DISPATCH(MemValue2Ref, value2_ref);
-PRO_DEF_MEM_DISPATCH(MemValue3Ref, value3_ref);
-PRO_DEF_MEM_DISPATCH(MemValue4Ref, value4_ref);
-PRO_DEF_MEM_DISPATCH(MemValue5Ref, value5_ref);
-PRO_DEF_MEM_DISPATCH(MemValue6Ref, value6_ref);
-PRO_DEF_MEM_DISPATCH(MemValue7Ref, value7_ref);
 
 struct ProxyStep : pro::facade_builder
     ::add_convention<MemStep, std::uint64_t(std::uint64_t) noexcept>
@@ -214,18 +149,6 @@ struct ProxyMultiStep : pro::facade_builder
 
 struct ProxyField : pro::facade_builder
     ::add_convention<MemValueRef, std::uint64_t&() noexcept>
-    ::support_copy<pro::constraint_level::nontrivial>
-    ::build {};
-
-struct ProxyManyFields : pro::facade_builder
-    ::add_convention<MemValue0Ref, std::uint16_t&() noexcept>
-    ::add_convention<MemValue1Ref, std::uint16_t&() noexcept>
-    ::add_convention<MemValue2Ref, std::uint16_t&() noexcept>
-    ::add_convention<MemValue3Ref, std::uint16_t&() noexcept>
-    ::add_convention<MemValue4Ref, std::uint16_t&() noexcept>
-    ::add_convention<MemValue5Ref, std::uint16_t&() noexcept>
-    ::add_convention<MemValue6Ref, std::uint16_t&() noexcept>
-    ::add_convention<MemValue7Ref, std::uint16_t&() noexcept>
     ::support_copy<pro::constraint_level::nontrivial>
     ::build {};
 
@@ -271,19 +194,6 @@ std::vector<si::existential_move_only<Interface>> make_si_objects(std::size_t ob
     return objects;
 }
 
-template <class Interface, std::size_t PayloadBytes>
-std::vector<si::existential_move_only<Interface>> make_si_many_field_objects(
-    std::size_t object_count) {
-    std::vector<si::existential_move_only<Interface>> objects;
-    objects.reserve(object_count);
-    for (std::size_t index = 0; index != object_count; ++index) {
-        with_type_index(index, [&]<int Id> {
-            objects.emplace_back(ManyFieldsModel<Id, PayloadBytes>{});
-        });
-    }
-    return objects;
-}
-
 template <class Facade, std::size_t PayloadBytes>
 std::vector<pro::proxy<Facade>> make_proxy_objects(std::size_t object_count) {
     std::vector<pro::proxy<Facade>> objects;
@@ -291,18 +201,6 @@ std::vector<pro::proxy<Facade>> make_proxy_objects(std::size_t object_count) {
     for (std::size_t index = 0; index != object_count; ++index) {
         with_type_index(index, [&]<int Id> {
             objects.emplace_back(pro::make_proxy<Facade, Model<Id, PayloadBytes>>());
-        });
-    }
-    return objects;
-}
-
-template <class Facade, std::size_t PayloadBytes>
-std::vector<pro::proxy<Facade>> make_proxy_many_field_objects(std::size_t object_count) {
-    std::vector<pro::proxy<Facade>> objects;
-    objects.reserve(object_count);
-    for (std::size_t index = 0; index != object_count; ++index) {
-        with_type_index(index, [&]<int Id> {
-            objects.emplace_back(pro::make_proxy<Facade, ManyFieldsModel<Id, PayloadBytes>>());
         });
     }
     return objects;
@@ -412,72 +310,6 @@ void run_field_group(ankerl::nanobench::Bench& bench,
 }
 
 template <std::size_t PayloadBytes>
-void run_many_fields_group(ankerl::nanobench::Bench& bench,
-                           std::string_view label,
-                           std::size_t object_count) {
-    auto virtual_objects =
-        make_virtual_objects<VirtualManyFields, VirtualManyFieldsModel, PayloadBytes>(
-            object_count);
-    run_bench(bench, std::string{label} + "/many-fields/virtual-ref", virtual_objects,
-              [](auto& object, std::uint64_t input) noexcept {
-                  auto& value0 = object->value0_ref();
-                  auto& value1 = object->value1_ref();
-                  auto& value2 = object->value2_ref();
-                  auto& value3 = object->value3_ref();
-                  auto& value4 = object->value4_ref();
-                  auto& value5 = object->value5_ref();
-                  auto& value6 = object->value6_ref();
-                  auto& value7 = object->value7_ref();
-                  value0 += input;
-                  value1 += value0;
-                  value2 += value1;
-                  value3 += value2;
-                  value4 += value3;
-                  value5 += value4;
-                  value6 += value5;
-                  value7 += value6;
-                  return value0 ^ value1 ^ value2 ^ value3 ^ value4 ^ value5 ^ value6 ^ value7;
-              });
-
-    auto si_objects = make_si_many_field_objects<ManyFieldsInterface, PayloadBytes>(object_count);
-    run_bench(bench, std::string{label} + "/many-fields/si-data-members", si_objects,
-              [](auto& object, std::uint64_t input) noexcept {
-                  *object.value0 += input;
-                  *object.value1 += *object.value0;
-                  *object.value2 += *object.value1;
-                  *object.value3 += *object.value2;
-                  *object.value4 += *object.value3;
-                  *object.value5 += *object.value4;
-                  *object.value6 += *object.value5;
-                  *object.value7 += *object.value6;
-                  return *object.value0 ^ *object.value1 ^ *object.value2 ^ *object.value3 ^
-                         *object.value4 ^ *object.value5 ^ *object.value6 ^ *object.value7;
-              });
-
-    auto proxy_objects = make_proxy_many_field_objects<ProxyManyFields, PayloadBytes>(object_count);
-    run_bench(bench, std::string{label} + "/many-fields/proxy-ref", proxy_objects,
-              [](auto& object, std::uint64_t input) noexcept {
-                  auto& value0 = object->value0_ref();
-                  auto& value1 = object->value1_ref();
-                  auto& value2 = object->value2_ref();
-                  auto& value3 = object->value3_ref();
-                  auto& value4 = object->value4_ref();
-                  auto& value5 = object->value5_ref();
-                  auto& value6 = object->value6_ref();
-                  auto& value7 = object->value7_ref();
-                  value0 += input;
-                  value1 += value0;
-                  value2 += value1;
-                  value3 += value2;
-                  value4 += value3;
-                  value5 += value4;
-                  value6 += value5;
-                  value7 += value6;
-                  return value0 ^ value1 ^ value2 ^ value3 ^ value4 ^ value5 ^ value6 ^ value7;
-              });
-}
-
-template <std::size_t PayloadBytes>
 void run_lifetime_group(ankerl::nanobench::Bench& bench,
                         std::string_view label,
                         std::size_t object_count) {
@@ -497,7 +329,6 @@ void run_payload_groups(ankerl::nanobench::Bench& bench,
     run_single_function_group<PayloadBytes>(bench, label, object_count);
     run_multi_function_group<PayloadBytes>(bench, label, object_count);
     run_field_group<PayloadBytes>(bench, label, object_count);
-    run_many_fields_group<PayloadBytes>(bench, label, object_count);
     run_lifetime_group<PayloadBytes>(bench, label, object_count);
 }
 
@@ -510,7 +341,7 @@ int main(int argc, char** argv) {
     bench.title("Structural Interface vs virtual functions vs Microsoft Proxy")
         .unit("dispatch or object")
         .warmup(3)
-        .minEpochIterations(200)
+        .minEpochTime(std::chrono::milliseconds(1000))
         .relative(true);
 
     run_payload_groups<16>(bench, "small-16B", object_count);
