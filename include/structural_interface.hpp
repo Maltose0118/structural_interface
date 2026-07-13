@@ -33,16 +33,18 @@ using meta_info = std::meta::info;
 template <class T>
 using bare_t = std::remove_cvref_t<T>;
 
-consteval auto access() noexcept {
+consteval auto reflection_access_context() noexcept {
     return std::meta::access_context::current();
 }
 
 consteval auto reflected_members(meta_info type) {
-    return std::meta::reflect_constant_array(std::meta::members_of(type, access()));
+    return std::meta::reflect_constant_array(
+        std::meta::members_of(type, reflection_access_context()));
 }
 
 consteval auto reflected_bases(meta_info type) {
-    return std::meta::reflect_constant_array(std::meta::bases_of(type, access()));
+    return std::meta::reflect_constant_array(
+        std::meta::bases_of(type, reflection_access_context()));
 }
 
 consteval bool is_relevant_member(meta_info member) {
@@ -134,10 +136,10 @@ template <class Owner, auto InterfaceMember, class Signature = member_pointer_ty
 struct function_proxy;
 
 template <class Owner, class I>
-struct generated_function_members;
+struct generated_interface_members;
 
 template <class Owner, class I>
-using generated_function_members_t = typename generated_function_members<Owner, I>::type;
+using generated_interface_members_t = typename generated_interface_members<Owner, I>::type;
 
 template <class Ptr, class Owner>
 struct rebind_member_pointer;
@@ -196,7 +198,7 @@ using rebind_member_pointer_t = typename rebind_member_pointer<Ptr, Owner>::type
 
 template <auto InterfaceMember, class T>
 consteval rebind_member_pointer_t<member_pointer_type_t<InterfaceMember>, bare_t<T>>
-concrete_member_pointer() {
+get_concrete_member_pointer() {
     constexpr auto member = [] consteval {
         using interface_pointer = member_pointer_type_t<InterfaceMember>;
         using concrete_pointer = rebind_member_pointer_t<interface_pointer, bare_t<T>>;
@@ -220,13 +222,13 @@ concrete_member_pointer() {
 }
 
 template <class Owner>
-void* object_slot(Owner& owner) noexcept;
+void* get_object_pointer(Owner& owner) noexcept;
 
 template <auto InterfaceMember, class ErasedCall, class Slots>
-ErasedCall metadata_slot(const Slots& slots) noexcept;
+ErasedCall get_function_slot(const Slots& slots) noexcept;
 
 template <class Generated, auto InterfaceMember>
-consteval std::ptrdiff_t generated_member_offset();
+consteval std::ptrdiff_t get_generated_member_offset();
 
 #define SI_FUNCTION_PROXY(CV, REF, NOEXCEPT_SPEC, OBJECT_EXPR)                  \
     template <class Owner, auto InterfaceMember, class I, class R, class... Args> \
@@ -234,13 +236,13 @@ consteval std::ptrdiff_t generated_member_offset();
         using erased_call = R (*)(void*, Args...) NOEXCEPT_SPEC;                \
                                                                                 \
         R operator()(Args... args) CV REF NOEXCEPT_SPEC {                       \
-            constexpr auto offset = generated_member_offset<                    \
-                generated_function_members_t<Owner, I>, InterfaceMember>();     \
+            constexpr auto offset = get_generated_member_offset<               \
+                generated_interface_members_t<Owner, I>, InterfaceMember>();  \
             auto* self = const_cast<function_proxy*>(this);                     \
             auto* owner = reinterpret_cast<Owner*>(                             \
                 reinterpret_cast<std::byte*>(self) - offset);                   \
-            void* object = object_slot(*owner);                                 \
-            auto call = metadata_slot<InterfaceMember, erased_call>(             \
+            void* object = get_object_pointer(*owner);                          \
+            auto call = get_function_slot<InterfaceMember, erased_call>(         \
                 owner->_si_details_.metadata_ptr()->functions);                 \
             if constexpr (std::is_void_v<R>) {                                  \
                 call(object, std::forward<Args>(args)...);                      \
@@ -283,8 +285,8 @@ SI_FUNCTION_PROXY(const volatile, &&, noexcept, SI_PROXY_OBJECT_RVALUE)
 #undef SI_FUNCTION_PROXY
 
 template <auto InterfaceMember, class T>
-void* concrete_field_address(void* object) noexcept {
-    constexpr auto member = concrete_member_pointer<InterfaceMember, T>();
+void* get_concrete_field_address(void* object) noexcept {
+    constexpr auto member = get_concrete_member_pointer<InterfaceMember, T>();
     return std::addressof(static_cast<T*>(object)->*member);
 }
 
@@ -299,7 +301,7 @@ struct erased_function_pointer;
         template <class T>                                                      \
         consteval static type thunk_for() {                                     \
             return +[](void* object, Args... args) NOEXCEPT_SPEC -> R {          \
-                constexpr auto member = concrete_member_pointer<InterfaceMember, T>(); \
+                constexpr auto member = get_concrete_member_pointer<InterfaceMember, T>(); \
                 if constexpr (std::is_void_v<R>) {                              \
                     std::invoke(member, OBJECT_EXPR(static_cast<T*>(object)), std::forward<Args>(args)...); \
                 } else {                                                        \
@@ -342,7 +344,7 @@ SI_ERASED_FUNCTION_POINTER(const volatile, &&, noexcept, SI_PROXY_OBJECT_RVALUE)
 #undef SI_ERASED_FUNCTION_POINTER
 
 template <class I>
-struct generated_metadata_members {
+struct generated_function_slots {
     struct type;
 
     consteval {
@@ -360,10 +362,10 @@ struct generated_metadata_members {
 };
 
 template <class I>
-using generated_metadata_members_t = typename generated_metadata_members<I>::type;
+using generated_function_slots_t = typename generated_function_slots<I>::type;
 
 template <class Generated, auto InterfaceMember, class Proxy>
-consteval auto generated_proxy_member() {
+consteval auto get_member_pointer() {
     template for (constexpr auto member : [: reflected_members(^^Generated) :]) {
         if constexpr (std::meta::is_nonstatic_data_member(member) &&
                       std::meta::has_identifier(member) &&
@@ -379,7 +381,7 @@ consteval auto generated_proxy_member() {
 }
 
 template <class Generated, auto InterfaceMember>
-consteval meta_info generated_member_info() {
+consteval meta_info get_generated_member_info() {
     template for (constexpr auto member : [: reflected_members(^^Generated) :]) {
         if constexpr (std::meta::is_nonstatic_data_member(member) &&
                       std::meta::has_identifier(member) &&
@@ -393,20 +395,20 @@ consteval meta_info generated_member_info() {
 }
 
 template <class Generated, auto InterfaceMember>
-consteval std::ptrdiff_t generated_member_offset() {
-    constexpr auto member = generated_member_info<Generated, InterfaceMember>();
+consteval std::ptrdiff_t get_generated_member_offset() {
+    constexpr auto member = get_generated_member_info<Generated, InterfaceMember>();
     constexpr auto offset = std::meta::offset_of(member);
     return offset.bytes;
 }
 
 template <class I, class T>
-consteval generated_metadata_members_t<I> metadata_function_slots() {
-    generated_metadata_members_t<I> slots{};
+consteval generated_function_slots_t<I> make_function_slots() {
+    generated_function_slots_t<I> slots{};
     template for (constexpr auto member : [: reflected_members(^^I) :]) {
         if constexpr (is_interface_function(member)) {
             using erased_call = typename erased_function_pointer<member>::type;
             constexpr auto slot_member =
-                generated_proxy_member<generated_metadata_members_t<I>, member, erased_call>();
+                get_member_pointer<generated_function_slots_t<I>, member, erased_call>();
             slots.*slot_member = erased_function_pointer<member>::template thunk_for<T>();
         }
     }
@@ -414,14 +416,14 @@ consteval generated_metadata_members_t<I> metadata_function_slots() {
 }
 
 template <auto InterfaceMember, class ErasedCall, class Slots>
-ErasedCall metadata_slot(const Slots& slots) noexcept {
+ErasedCall get_function_slot(const Slots& slots) noexcept {
     constexpr auto slot_member =
-        generated_proxy_member<Slots, InterfaceMember, ErasedCall>();
+        get_member_pointer<Slots, InterfaceMember, ErasedCall>();
     return slots.*slot_member;
 }
 
 template <class Owner, class I>
-struct generated_function_members {
+struct generated_interface_members {
     struct type;
 
     consteval {
@@ -445,7 +447,7 @@ struct generated_function_members {
 };
 
 template <class Owner>
-void* object_slot(Owner& owner) noexcept {
+void* get_object_pointer(Owner& owner) noexcept {
     return owner._si_details_.object_ptr();
 }
 
@@ -455,9 +457,10 @@ void bind_member_proxies(Owner& owner) noexcept {
         if constexpr (is_interface_field(member)) {
             using field_type = member_object_type_t<member>;
             constexpr auto base_member =
-                generated_proxy_member<generated_function_members_t<Owner, I>, member, field_type*>();
+                get_member_pointer<generated_interface_members_t<Owner, I>, member, field_type*>();
             owner.*base_member =
-                static_cast<field_type*>(concrete_field_address<member, T>(object_slot(owner)));
+                static_cast<field_type*>(
+                    get_concrete_field_address<member, T>(get_object_pointer(owner)));
         }
     }
 }
@@ -468,8 +471,8 @@ void copy_member_proxies(Owner& owner, const Owner& other) noexcept {
         template for (constexpr auto member : [: reflected_members(^^I) :]) {
             if constexpr (is_interface_field(member)) {
                 using field_type = member_object_type_t<member>;
-                constexpr auto proxy_member = generated_proxy_member<
-                    generated_function_members_t<Owner, I>, member, field_type*>();
+                constexpr auto proxy_member = get_member_pointer<
+                    generated_interface_members_t<Owner, I>, member, field_type*>();
                 owner.*proxy_member = nullptr;
             }
         }
@@ -480,12 +483,12 @@ void copy_member_proxies(Owner& owner, const Owner& other) noexcept {
         if constexpr (is_interface_field(member)) {
             using field_type = member_object_type_t<member>;
             constexpr auto base_member =
-                generated_proxy_member<generated_function_members_t<Owner, I>, member, field_type*>();
+                get_member_pointer<generated_interface_members_t<Owner, I>, member, field_type*>();
             auto* other_object = static_cast<const std::byte*>(other._si_details_.object_ptr());
             auto* other_field = reinterpret_cast<const std::byte*>(other.*base_member);
             auto offset = other_field - other_object;
             owner.*base_member = reinterpret_cast<field_type*>(
-                static_cast<std::byte*>(object_slot(owner)) + offset);
+                static_cast<std::byte*>(get_object_pointer(owner)) + offset);
         }
     }
 }
@@ -570,7 +573,7 @@ consteval bool satisfies_interface_members() {
 
 template <class I>
 struct interface_metadata {
-    generated_metadata_members_t<I> functions;
+    generated_function_slots_t<I> functions;
     void (*destroy)(void*, bool) noexcept;
     void* (*copy_construct)(void*, const void*, bool);
     void (*move_construct)(void*, void*) noexcept;
@@ -602,7 +605,7 @@ void* copy_construct_object(void* destination_storage,
 }
 
 template <class T>
-consteval auto copy_construct_fn() {
+consteval auto get_copy_constructor() {
     if constexpr (std::copy_constructible<T>) {
         return &copy_construct_object<T>;
     } else {
@@ -617,14 +620,14 @@ void move_construct_object(void* destination_storage, void* source) noexcept {
 
 template <class I, class T>
 inline const interface_metadata<I> metadata_for = {
-    .functions = metadata_function_slots<I, T>(),
+    .functions = make_function_slots<I, T>(),
     .destroy = &destroy_object<T>,
-    .copy_construct = copy_construct_fn<T>(),
+    .copy_construct = get_copy_constructor<T>(),
     .move_construct = &move_construct_object<T>,
 };
 
 template <class I, class Owner>
-struct _si_existential_details {
+struct existential_storage {
     union object_storage {
         alignas(sbo_storage_alignment) std::byte inline_storage[sbo_storage_size]{};
         void* heap_object;
@@ -684,7 +687,7 @@ struct _si_existential_details {
         }
     }
 
-    void copy_from(const _si_existential_details& other) {
+    void copy_from(const existential_storage& other) {
         if (!other.has_object()) {
             return;
         }
@@ -729,7 +732,7 @@ struct _si_existential_details {
 };
 
 template <class I, class Owner>
-struct _si_ref_details {
+struct reference_storage {
     void* object = nullptr;
     const interface_metadata<I>* metadata = nullptr;
 
@@ -759,7 +762,7 @@ concept satisfies =
      std::same_as<std::remove_cvref_t<T>, existential_ref<I>>);
 
 template <class I>
-class existential : public detail::generated_function_members_t<existential<I>, I> {
+class existential : public detail::generated_interface_members_t<existential<I>, I> {
 public:
     template <class T>
         requires (!std::same_as<std::remove_cvref_t<T>, existential>) &&
@@ -804,9 +807,9 @@ public:
 
 private:
     template <class, class>
-    friend struct detail::_si_existential_details;
+    friend struct detail::existential_storage;
     template <class Owner>
-    friend void* detail::object_slot(Owner&) noexcept;
+    friend void* detail::get_object_pointer(Owner&) noexcept;
     template <class, auto, class>
     friend struct detail::function_proxy;
     template <class Owner, class Interface, class T>
@@ -814,11 +817,11 @@ private:
     template <class Owner, class Interface>
     friend void detail::copy_member_proxies(Owner&, const Owner&) noexcept;
 
-    detail::_si_existential_details<I, existential<I>> _si_details_;
+    detail::existential_storage<I, existential<I>> _si_details_;
 };
 
 template <class I>
-class existential_move_only : public detail::generated_function_members_t<existential_move_only<I>, I> {
+class existential_move_only : public detail::generated_interface_members_t<existential_move_only<I>, I> {
 public:
     template <class T>
         requires (!std::same_as<std::remove_cvref_t<T>, existential_move_only>) &&
@@ -850,9 +853,9 @@ public:
 
 private:
     template <class, class>
-    friend struct detail::_si_existential_details;
+    friend struct detail::existential_storage;
     template <class Owner>
-    friend void* detail::object_slot(Owner&) noexcept;
+    friend void* detail::get_object_pointer(Owner&) noexcept;
     template <class, auto, class>
     friend struct detail::function_proxy;
     template <class Owner, class Interface, class T>
@@ -860,11 +863,11 @@ private:
     template <class Owner, class Interface>
     friend void detail::copy_member_proxies(Owner&, const Owner&) noexcept;
 
-    detail::_si_existential_details<I, existential_move_only<I>> _si_details_;
+    detail::existential_storage<I, existential_move_only<I>> _si_details_;
 };
 
 template <class I>
-class existential_ref : public detail::generated_function_members_t<existential_ref<I>, I> {
+class existential_ref : public detail::generated_interface_members_t<existential_ref<I>, I> {
 public:
     template <class T>
         requires satisfies<std::remove_cvref_t<T>, I>
@@ -877,11 +880,11 @@ private:
     template <class, auto, class>
     friend struct detail::function_proxy;
     template <class Owner>
-    friend void* detail::object_slot(Owner&) noexcept;
+    friend void* detail::get_object_pointer(Owner&) noexcept;
     template <class Owner, class Interface, class T>
     friend void detail::bind_member_proxies(Owner&) noexcept;
 
-    detail::_si_ref_details<I, existential_ref<I>> _si_details_;
+    detail::reference_storage<I, existential_ref<I>> _si_details_;
 };
 
 } // namespace si
