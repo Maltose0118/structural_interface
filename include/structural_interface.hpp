@@ -2,6 +2,7 @@
 
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <meta>
@@ -55,6 +56,14 @@ consteval bool is_relevant_member(meta_info member) {
            !std::meta::is_static_member(member) &&
            (std::meta::is_nonstatic_data_member(member) ||
             std::meta::is_function(member));
+}
+
+consteval bool is_interface_function(meta_info member) {
+    return is_relevant_member(member) && std::meta::is_function(member);
+}
+
+consteval bool is_interface_field(meta_info member) {
+    return is_relevant_member(member) && std::meta::is_nonstatic_data_member(member);
 }
 
 consteval bool identifier_equal(meta_info left, meta_info right) {
@@ -146,6 +155,9 @@ struct member_object_type<M C::*> {
     using type = M;
 };
 
+template <auto Member>
+using member_object_type_t = typename member_object_type<member_pointer_type_t<Member>>::type;
+
 #define SI_REBIND_MEMBER_FUNCTION(CV, REF, NOEXCEPT_SPEC)                       \
     template <class R, class C, class... Args, class Owner>                     \
     struct rebind_member_pointer<R (C::*)(Args...) CV REF NOEXCEPT_SPEC, Owner> { \
@@ -208,7 +220,7 @@ concrete_member_pointer() {
 }
 
 template <class Owner>
-void** object_slot(Owner& owner) noexcept;
+void* object_slot(Owner& owner) noexcept;
 
 template <auto InterfaceMember, class ErasedCall, class Slots>
 ErasedCall metadata_slot(const Slots& slots) noexcept;
@@ -221,20 +233,15 @@ consteval std::ptrdiff_t generated_member_offset();
     struct function_proxy<Owner, InterfaceMember, R (I::*)(Args...) CV REF NOEXCEPT_SPEC> { \
         using erased_call = R (*)(void*, Args...) NOEXCEPT_SPEC;                \
                                                                                 \
-        template <class T>                                                      \
-        void bind(Owner&) noexcept {}                                           \
-                                                                                \
-        void rebind_from(const function_proxy&, Owner&) noexcept {}             \
-                                                                                \
         R operator()(Args... args) CV REF NOEXCEPT_SPEC {                       \
             constexpr auto offset = generated_member_offset<                    \
                 generated_function_members_t<Owner, I>, InterfaceMember>();     \
             auto* self = const_cast<function_proxy*>(this);                     \
             auto* owner = reinterpret_cast<Owner*>(                             \
                 reinterpret_cast<std::byte*>(self) - offset);                   \
-            void* object = *object_slot(*owner);                                \
+            void* object = object_slot(*owner);                                 \
             auto call = metadata_slot<InterfaceMember, erased_call>(             \
-                owner->_si_details_.metadata->functions);                       \
+                owner->_si_details_.metadata_ptr()->functions);                 \
             if constexpr (std::is_void_v<R>) {                                  \
                 call(object, std::forward<Args>(args)...);                      \
             } else {                                                            \
@@ -341,10 +348,7 @@ struct generated_metadata_members {
     consteval {
         std::vector<meta_info> specs;
         template for (constexpr auto member : [: reflected_members(^^I) :]) {
-            if constexpr (std::meta::is_function(member) &&
-                          !std::meta::is_special_member_function(member) &&
-                          !std::meta::is_constructor(member) &&
-                          !std::meta::is_destructor(member)) {
+            if constexpr (is_interface_function(member)) {
                 using proxy_type = typename erased_function_pointer<member>::type;
                 specs.push_back(std::meta::data_member_spec(
                     ^^proxy_type,
@@ -399,10 +403,7 @@ template <class I, class T>
 consteval generated_metadata_members_t<I> metadata_function_slots() {
     generated_metadata_members_t<I> slots{};
     template for (constexpr auto member : [: reflected_members(^^I) :]) {
-        if constexpr (std::meta::is_function(member) &&
-                      !std::meta::is_special_member_function(member) &&
-                      !std::meta::is_constructor(member) &&
-                      !std::meta::is_destructor(member)) {
+        if constexpr (is_interface_function(member)) {
             using erased_call = typename erased_function_pointer<member>::type;
             constexpr auto slot_member =
                 generated_proxy_member<generated_metadata_members_t<I>, member, erased_call>();
@@ -426,17 +427,14 @@ struct generated_function_members {
     consteval {
         std::vector<meta_info> specs;
         template for (constexpr auto member : [: reflected_members(^^I) :]) {
-            if constexpr (std::meta::is_function(member) &&
-                          !std::meta::is_special_member_function(member) &&
-                          !std::meta::is_constructor(member) &&
-                          !std::meta::is_destructor(member)) {
+            if constexpr (is_interface_function(member)) {
                 using proxy_type = function_proxy<Owner, member>;
                 specs.push_back(std::meta::data_member_spec(
                     ^^proxy_type,
-                    {.name = std::string(std::meta::identifier_of(member))}));
-            } else if constexpr (std::meta::is_nonstatic_data_member(member)) {
-                using proxy_type = member_pointer_type_t<member>;
-                using field_type = typename member_object_type<proxy_type>::type;
+                    {.name = std::string(std::meta::identifier_of(member)),
+                     .no_unique_address = true}));
+            } else if constexpr (is_interface_field(member)) {
+                using field_type = member_object_type_t<member>;
                 specs.push_back(std::meta::data_member_spec(
                     ^^field_type*,
                     {.name = std::string(std::meta::identifier_of(member))}));
@@ -447,53 +445,47 @@ struct generated_function_members {
 };
 
 template <class Owner>
-void** object_slot(Owner& owner) noexcept {
-    return &owner._si_details_.object;
+void* object_slot(Owner& owner) noexcept {
+    return owner._si_details_.object_ptr();
 }
 
 template <class Owner, class I, class T>
 void bind_member_proxies(Owner& owner) noexcept {
     template for (constexpr auto member : [: reflected_members(^^I) :]) {
-        if constexpr (std::meta::is_function(member) &&
-                      !std::meta::is_special_member_function(member) &&
-                      !std::meta::is_constructor(member) &&
-                      !std::meta::is_destructor(member)) {
-            using proxy_type = function_proxy<Owner, member>;
-            constexpr auto base_member =
-                generated_proxy_member<generated_function_members_t<Owner, I>, member, proxy_type>();
-            (owner.*base_member).template bind<T>(owner);
-        } else if constexpr (std::meta::is_nonstatic_data_member(member)) {
-            using proxy_type = member_pointer_type_t<member>;
-            using field_type = typename member_object_type<proxy_type>::type;
+        if constexpr (is_interface_field(member)) {
+            using field_type = member_object_type_t<member>;
             constexpr auto base_member =
                 generated_proxy_member<generated_function_members_t<Owner, I>, member, field_type*>();
             owner.*base_member =
-                static_cast<field_type*>(concrete_field_address<member, T>(*object_slot(owner)));
+                static_cast<field_type*>(concrete_field_address<member, T>(object_slot(owner)));
         }
     }
 }
 
 template <class Owner, class I>
 void copy_member_proxies(Owner& owner, const Owner& other) noexcept {
+    if (!other._si_details_.has_object()) {
+        template for (constexpr auto member : [: reflected_members(^^I) :]) {
+            if constexpr (is_interface_field(member)) {
+                using field_type = member_object_type_t<member>;
+                constexpr auto proxy_member = generated_proxy_member<
+                    generated_function_members_t<Owner, I>, member, field_type*>();
+                owner.*proxy_member = nullptr;
+            }
+        }
+        return;
+    }
+
     template for (constexpr auto member : [: reflected_members(^^I) :]) {
-        if constexpr (std::meta::is_function(member) &&
-                      !std::meta::is_special_member_function(member) &&
-                      !std::meta::is_constructor(member) &&
-                      !std::meta::is_destructor(member)) {
-            using proxy_type = function_proxy<Owner, member>;
-            constexpr auto base_member =
-                generated_proxy_member<generated_function_members_t<Owner, I>, member, proxy_type>();
-            (owner.*base_member).rebind_from(other.*base_member, owner);
-        } else if constexpr (std::meta::is_nonstatic_data_member(member)) {
-            using proxy_type = member_pointer_type_t<member>;
-            using field_type = typename member_object_type<proxy_type>::type;
+        if constexpr (is_interface_field(member)) {
+            using field_type = member_object_type_t<member>;
             constexpr auto base_member =
                 generated_proxy_member<generated_function_members_t<Owner, I>, member, field_type*>();
-            auto* other_object = static_cast<std::byte*>(other._si_details_.object);
-            auto* other_field = reinterpret_cast<std::byte*>(other.*base_member);
+            auto* other_object = static_cast<const std::byte*>(other._si_details_.object_ptr());
+            auto* other_field = reinterpret_cast<const std::byte*>(other.*base_member);
             auto offset = other_field - other_object;
             owner.*base_member = reinterpret_cast<field_type*>(
-                static_cast<std::byte*>(*object_slot(owner)) + offset);
+                static_cast<std::byte*>(object_slot(owner)) + offset);
         }
     }
 }
@@ -518,24 +510,6 @@ consteval bool concrete_has_matching_member() {
     }
 
     return false;
-}
-
-template <auto InterfaceMember, class Concrete>
-consteval auto matching_concrete_member() {
-    using interface_pointer = member_pointer_type_t<InterfaceMember>;
-    using concrete_pointer = rebind_member_pointer_t<interface_pointer, Concrete>;
-
-    template for (constexpr auto concrete_member : [: reflected_members(^^Concrete) :]) {
-        if constexpr (is_relevant_member(concrete_member) &&
-                      identifier_equal(InterfaceMember, concrete_member) &&
-                      member_shapes_equal(InterfaceMember, concrete_member)) {
-            if constexpr (requires { std::meta::extract<concrete_pointer>(concrete_member); }) {
-                return concrete_member;
-            }
-        }
-    }
-
-    return meta_info{};
 }
 
 template <class I, class T>
@@ -594,90 +568,107 @@ consteval bool satisfies_interface_members() {
     return true;
 }
 
+template <class I>
+struct interface_metadata {
+    generated_metadata_members_t<I> functions;
+    void (*destroy)(void*, bool) noexcept;
+    void* (*copy_construct)(void*, const void*, bool);
+    void (*move_construct)(void*, void*) noexcept;
+};
+
 template <class T>
 inline constexpr bool fits_sbo =
     sizeof(T) <= sbo_storage_size &&
     alignof(T) <= sbo_storage_alignment &&
     alignof(T) <= alignof(std::max_align_t);
 
-template <class I>
-struct interface_metadata {
-    generated_metadata_members_t<I> functions;
-    void (*destroy)(void*) noexcept;
-    void (*copy_construct)(void*, void**, const void*);
-    void (*move_construct)(void*, void**, void*);
-    const void* type_token;
-};
-
 template <class T>
-void destroy_small(void* object) noexcept {
-    std::destroy_at(static_cast<T*>(object));
+void destroy_object(void* object, bool inline_storage) noexcept {
+    if (inline_storage) {
+        std::destroy_at(static_cast<T*>(object));
+    } else {
+        delete static_cast<T*>(object);
+    }
 }
 
 template <class T>
-void destroy_large(void* object) noexcept {
-    delete static_cast<T*>(object);
-}
-
-template <class T>
-void copy_construct_small(void* storage, void** object, const void* source) {
-    ::new (storage) T(*static_cast<const T*>(source));
-    *object = storage;
-}
-
-template <class T>
-void copy_construct_large(void*, void** object, const void* source) {
-    *object = new T(*static_cast<const T*>(source));
+void* copy_construct_object(void* destination_storage,
+                            const void* source,
+                            bool source_inline) {
+    if (source_inline) {
+        return ::new (destination_storage) T(*static_cast<const T*>(source));
+    }
+    return new T(*static_cast<const T*>(source));
 }
 
 template <class T>
 consteval auto copy_construct_fn() {
     if constexpr (std::copy_constructible<T>) {
-        if constexpr (fits_sbo<T>) {
-            return &copy_construct_small<T>;
-        } else {
-            return &copy_construct_large<T>;
-        }
+        return &copy_construct_object<T>;
     } else {
-        return static_cast<void (*)(void*, void**, const void*)>(nullptr);
+        return static_cast<void* (*)(void*, const void*, bool)>(nullptr);
     }
 }
 
 template <class T>
-void move_construct_small(void* storage, void** object, void* source) {
-    ::new (storage) T(std::move(*static_cast<T*>(source)));
-    *object = storage;
-}
-
-template <class T>
-void move_construct_large(void*, void** object, void* source) {
-    *object = source;
+void move_construct_object(void* destination_storage, void* source) noexcept {
+    ::new (destination_storage) T(std::move(*static_cast<T*>(source)));
 }
 
 template <class I, class T>
 inline const interface_metadata<I> metadata_for = {
     .functions = metadata_function_slots<I, T>(),
-    .destroy = fits_sbo<T> ? &destroy_small<T> : &destroy_large<T>,
+    .destroy = &destroy_object<T>,
     .copy_construct = copy_construct_fn<T>(),
-    .move_construct = fits_sbo<T> ? &move_construct_small<T> : &move_construct_large<T>,
-    .type_token = &metadata_for<I, T>,
+    .move_construct = &move_construct_object<T>,
 };
 
 template <class I, class Owner>
 struct _si_existential_details {
-    alignas(sbo_storage_alignment) std::byte storage[sbo_storage_size]{};
-    void* object = nullptr;
-    const interface_metadata<I>* metadata = nullptr;
+    union object_storage {
+        alignas(sbo_storage_alignment) std::byte inline_storage[sbo_storage_size]{};
+        void* heap_object;
+
+        object_storage() noexcept : inline_storage{} {}
+        ~object_storage() {}
+    } storage;
+
+    std::uintptr_t metadata_bits = 0;
+
+    using metadata_pointer = const interface_metadata<I>*;
+    static constexpr std::uintptr_t inline_tag = 1;
+
+    bool is_inline() const noexcept {
+        return (metadata_bits & inline_tag) != 0;
+    }
+
+    metadata_pointer metadata_ptr() const noexcept {
+        return reinterpret_cast<metadata_pointer>(metadata_bits & ~inline_tag);
+    }
+
+    void set_metadata(metadata_pointer metadata, bool inline_storage) noexcept {
+        auto bits = reinterpret_cast<std::uintptr_t>(metadata);
+        metadata_bits = bits | (inline_storage ? inline_tag : 0);
+    }
+
+    void* object_ptr() noexcept {
+        return is_inline() ? static_cast<void*>(storage.inline_storage)
+                           : storage.heap_object;
+    }
+
+    const void* object_ptr() const noexcept {
+        return is_inline() ? static_cast<const void*>(storage.inline_storage)
+                           : storage.heap_object;
+    }
 
     bool has_object() const noexcept {
-        return object != nullptr;
+        return metadata_bits != 0;
     }
 
     void destroy() noexcept {
-        if (object != nullptr) {
-            metadata->destroy(object);
-            object = nullptr;
-            metadata = nullptr;
+        if (has_object()) {
+            metadata_ptr()->destroy(object_ptr(), is_inline());
+            metadata_bits = 0;
         }
     }
 
@@ -685,29 +676,26 @@ struct _si_existential_details {
     void emplace(Args&&... args) {
         using concrete = std::remove_cvref_t<T>;
         if constexpr (fits_sbo<concrete>) {
-            ::new (storage) concrete(std::forward<Args>(args)...);
-            object = storage;
+            ::new (storage.inline_storage) concrete(std::forward<Args>(args)...);
+            set_metadata(&metadata_for<I, concrete>, true);
         } else {
-            object = new concrete(std::forward<Args>(args)...);
+            storage.heap_object = new concrete(std::forward<Args>(args)...);
+            set_metadata(&metadata_for<I, concrete>, false);
         }
-        metadata = &metadata_for<I, concrete>;
     }
 
     void copy_from(const _si_existential_details& other) {
-        other.metadata->copy_construct(storage, &object, other.object);
-        metadata = other.metadata;
-    }
-
-    void move_from(_si_existential_details& other) {
-        metadata = other.metadata;
-        if (other.object == other.storage) {
-            other.metadata->move_construct(storage, &object, other.object);
-            other.destroy();
-        } else {
-            object = other.object;
-            other.object = nullptr;
-            other.metadata = nullptr;
+        if (!other.has_object()) {
+            return;
         }
+        auto* other_metadata = other.metadata_ptr();
+        bool inline_storage = other.is_inline();
+        auto* copied = other_metadata->copy_construct(
+            storage.inline_storage, other.object_ptr(), inline_storage);
+        if (!inline_storage) {
+            storage.heap_object = copied;
+        }
+        set_metadata(other_metadata, inline_storage);
     }
 
     template <class T, class... Args>
@@ -721,18 +709,22 @@ struct _si_existential_details {
         if (!other._si_details_.has_object()) {
             return;
         }
-        metadata = other._si_details_.metadata;
-        if (other._si_details_.object == other._si_details_.storage) {
-            other._si_details_.metadata->move_construct(storage, &object, other._si_details_.object);
-            copy_member_proxies<Owner, I>(owner, other);
-            other._si_details_.destroy();
-            return;
+        auto* other_metadata = other._si_details_.metadata_ptr();
+        bool inline_storage = other._si_details_.is_inline();
+        if (inline_storage) {
+            other_metadata->move_construct(
+                storage.inline_storage, other._si_details_.object_ptr());
+        } else {
+            storage.heap_object = other._si_details_.storage.heap_object;
         }
-
-        object = other._si_details_.object;
+        set_metadata(other_metadata, inline_storage);
         copy_member_proxies<Owner, I>(owner, other);
-        other._si_details_.object = nullptr;
-        other._si_details_.metadata = nullptr;
+        if (inline_storage) {
+            other._si_details_.destroy();
+        } else {
+            other._si_details_.storage.heap_object = nullptr;
+            other._si_details_.metadata_bits = 0;
+        }
     }
 };
 
@@ -740,6 +732,14 @@ template <class I, class Owner>
 struct _si_ref_details {
     void* object = nullptr;
     const interface_metadata<I>* metadata = nullptr;
+
+    void* object_ptr() const noexcept {
+        return object;
+    }
+
+    const interface_metadata<I>* metadata_ptr() const noexcept {
+        return metadata;
+    }
 
     template <class T>
     void bind(T& value) noexcept {
@@ -806,7 +806,7 @@ private:
     template <class, class>
     friend struct detail::_si_existential_details;
     template <class Owner>
-    friend void** detail::object_slot(Owner&) noexcept;
+    friend void* detail::object_slot(Owner&) noexcept;
     template <class, auto, class>
     friend struct detail::function_proxy;
     template <class Owner, class Interface, class T>
@@ -852,7 +852,7 @@ private:
     template <class, class>
     friend struct detail::_si_existential_details;
     template <class Owner>
-    friend void** detail::object_slot(Owner&) noexcept;
+    friend void* detail::object_slot(Owner&) noexcept;
     template <class, auto, class>
     friend struct detail::function_proxy;
     template <class Owner, class Interface, class T>
@@ -877,7 +877,7 @@ private:
     template <class, auto, class>
     friend struct detail::function_proxy;
     template <class Owner>
-    friend void** detail::object_slot(Owner&) noexcept;
+    friend void* detail::object_slot(Owner&) noexcept;
     template <class Owner, class Interface, class T>
     friend void detail::bind_member_proxies(Owner&) noexcept;
 
