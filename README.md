@@ -212,5 +212,3 @@ xmake run structural_interface_example_basic
 
 - Runtime callable members with the same name as the interface but with multiple overloads are supported for ordinary function calls, but the runtime proxy for overloaded members still needs further design.
 - Data members are currently exposed as raw field pointers, e.g. `obj.name` has type `std::string*`.
-
-For a more detailed design description, see [doc/design.en.md](doc/design.en.md).

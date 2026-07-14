@@ -209,5 +209,3 @@ xmake run structural_interface_example_basic
 
 - runtime 同名 callable 成员已支持普通函数调用，但重载成员的 runtime proxy 仍需要进一步设计。
 - 数据成员当前以原始字段指针形式暴露，例如 `obj.name` 的类型为 `std::string*`。
-
-更完整的设计说明见 [doc/design.zh.md](doc/design.zh.md)。
