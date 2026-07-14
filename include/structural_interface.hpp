@@ -15,10 +15,10 @@
 
 namespace si {
 
-template <class I>
+template <class I, class Allocator = std::allocator<std::byte>>
 class existential;
 
-template <class I>
+template <class I, class Allocator = std::allocator<std::byte>>
 class existential_move_only;
 
 template <class I>
@@ -601,13 +601,13 @@ consteval bool satisfies_interface_members() {
     return true;
 }
 
-template <class I>
+template <class I, class Allocator>
 struct interface_metadata {
     generated_function_slots_t<I> functions;
     const void* type_token;
-    void (*destroy)(void*, bool) noexcept;
-    void* (*copy_construct)(void*, const void*, bool);
-    void (*move_construct)(void*, void*) noexcept;
+    void (*destroy)(void*, bool, Allocator&) noexcept;
+    void* (*copy_construct)(void*, const void*, bool, Allocator&);
+    void* (*move_construct)(void*, void*, bool, Allocator&);
 };
 
 template <class I>
@@ -625,46 +625,79 @@ inline constexpr bool fits_sbo =
     alignof(T) <= sbo_storage_alignment &&
     alignof(T) <= alignof(std::max_align_t);
 
-template <class T>
-void destroy_object(void* object, bool inline_storage) noexcept {
+template <class T, class Allocator>
+using object_allocator_t = typename std::allocator_traits<Allocator>::template rebind_alloc<T>;
+
+template <class T, class Allocator>
+using object_allocator_traits = std::allocator_traits<object_allocator_t<T, Allocator>>;
+
+template <class T, class Allocator>
+void destroy_object(void* object, bool inline_storage, Allocator& allocator) noexcept {
     if (inline_storage) {
         std::destroy_at(static_cast<T*>(object));
     } else {
-        delete static_cast<T*>(object);
+        using object_allocator = object_allocator_t<T, Allocator>;
+        using traits = object_allocator_traits<T, Allocator>;
+        object_allocator object_alloc(allocator);
+        T* typed_object = static_cast<T*>(object);
+        traits::destroy(object_alloc, typed_object);
+        traits::deallocate(object_alloc, typed_object, 1);
     }
 }
 
-template <class T>
+template <class T, class Allocator, class... Args>
+T* allocate_construct(Allocator& allocator, Args&&... args) {
+    using object_allocator = object_allocator_t<T, Allocator>;
+    using traits = object_allocator_traits<T, Allocator>;
+    object_allocator object_alloc(allocator);
+    T* object = traits::allocate(object_alloc, 1);
+    try {
+        traits::construct(object_alloc, object, std::forward<Args>(args)...);
+    } catch (...) {
+        traits::deallocate(object_alloc, object, 1);
+        throw;
+    }
+    return object;
+}
+
+template <class T, class Allocator>
 void* copy_construct_object(void* destination_storage,
                             const void* source,
-                            bool source_inline) {
+                            bool source_inline,
+                            Allocator& allocator) {
     if (source_inline) {
         return ::new (destination_storage) T(*static_cast<const T*>(source));
     }
-    return new T(*static_cast<const T*>(source));
+    return allocate_construct<T>(allocator, *static_cast<const T*>(source));
 }
 
-template <class T>
+template <class T, class Allocator>
 consteval auto get_copy_constructor() {
     if constexpr (std::copy_constructible<T>) {
-        return &copy_construct_object<T>;
+        return &copy_construct_object<T, Allocator>;
     } else {
-        return static_cast<void* (*)(void*, const void*, bool)>(nullptr);
+        return static_cast<void* (*)(void*, const void*, bool, Allocator&)>(nullptr);
     }
 }
 
-template <class T>
-void move_construct_object(void* destination_storage, void* source) noexcept {
-    ::new (destination_storage) T(std::move(*static_cast<T*>(source)));
+template <class T, class Allocator>
+void* move_construct_object(void* destination_storage,
+                            void* source,
+                            bool source_inline,
+                            Allocator& allocator) {
+    if (source_inline) {
+        return ::new (destination_storage) T(std::move(*static_cast<T*>(source)));
+    }
+    return allocate_construct<T>(allocator, std::move(*static_cast<T*>(source)));
 }
 
-template <class I, class T>
-inline const interface_metadata<I> metadata_for = {
+template <class I, class T, class Allocator>
+inline const interface_metadata<I, Allocator> metadata_for = {
     .functions = make_function_slots<I, T>(),
     .type_token = &type_token<T>,
-    .destroy = &destroy_object<T>,
-    .copy_construct = get_copy_constructor<T>(),
-    .move_construct = &move_construct_object<T>,
+    .destroy = &destroy_object<T, Allocator>,
+    .copy_construct = get_copy_constructor<T, Allocator>(),
+    .move_construct = &move_construct_object<T, Allocator>,
 };
 
 template <class I, class T>
@@ -673,7 +706,7 @@ inline const reference_metadata<I> reference_metadata_for = {
     .type_token = &type_token<T>,
 };
 
-template <class I, class Owner>
+template <class I, class Owner, class Allocator>
 struct existential_storage {
     union object_storage {
         alignas(sbo_storage_alignment) std::byte inline_storage[sbo_storage_size]{};
@@ -684,9 +717,13 @@ struct existential_storage {
     } storage;
 
     std::uintptr_t metadata_bits = 0;
+    [[no_unique_address]] Allocator allocator{};
 
-    using metadata_pointer = const interface_metadata<I>*;
+    using metadata_pointer = const interface_metadata<I, Allocator>*;
+    using allocator_traits = std::allocator_traits<Allocator>;
     static constexpr std::uintptr_t inline_tag = 1;
+
+    existential_storage() = default;
 
     bool is_inline() const noexcept {
         return (metadata_bits & inline_tag) != 0;
@@ -715,9 +752,20 @@ struct existential_storage {
         return metadata_bits != 0;
     }
 
+    explicit existential_storage(const Allocator& allocator_value)
+        : allocator(allocator_value) {}
+
+    Allocator& allocator_ref() noexcept {
+        return allocator;
+    }
+
+    const Allocator& allocator_ref() const noexcept {
+        return allocator;
+    }
+
     void destroy() noexcept {
         if (has_object()) {
-            metadata_ptr()->destroy(object_ptr(), is_inline());
+            metadata_ptr()->destroy(object_ptr(), is_inline(), allocator);
             metadata_bits = 0;
         }
     }
@@ -727,10 +775,11 @@ struct existential_storage {
         using concrete = std::remove_cvref_t<T>;
         if constexpr (fits_sbo<concrete>) {
             ::new (storage.inline_storage) concrete(std::forward<Args>(args)...);
-            set_metadata(&metadata_for<I, concrete>, true);
+            set_metadata(&metadata_for<I, concrete, Allocator>, true);
         } else {
-            storage.heap_object = new concrete(std::forward<Args>(args)...);
-            set_metadata(&metadata_for<I, concrete>, false);
+            storage.heap_object = allocate_construct<concrete>(allocator,
+                                                                std::forward<Args>(args)...);
+            set_metadata(&metadata_for<I, concrete, Allocator>, false);
         }
     }
 
@@ -741,7 +790,7 @@ struct existential_storage {
         auto* other_metadata = other.metadata_ptr();
         bool inline_storage = other.is_inline();
         auto* copied = other_metadata->copy_construct(
-            storage.inline_storage, other.object_ptr(), inline_storage);
+            storage.inline_storage, other.object_ptr(), inline_storage, allocator);
         if (!inline_storage) {
             storage.heap_object = copied;
         }
@@ -755,7 +804,7 @@ struct existential_storage {
         bind_member_proxies<Owner, I, concrete>(owner);
     }
 
-    void move_value_from(Owner& owner, Owner& other) noexcept {
+    void move_value_from(Owner& owner, Owner& other, bool can_steal) {
         if (!other._si_details_.has_object()) {
             return;
         }
@@ -763,17 +812,23 @@ struct existential_storage {
         bool inline_storage = other._si_details_.is_inline();
         if (inline_storage) {
             other_metadata->move_construct(
-                storage.inline_storage, other._si_details_.object_ptr());
-        } else {
+                storage.inline_storage, other._si_details_.object_ptr(), true, allocator);
+        } else if (can_steal) {
             storage.heap_object = other._si_details_.storage.heap_object;
+        } else {
+            auto* moved = other_metadata->move_construct(
+                storage.inline_storage, other._si_details_.object_ptr(), false, allocator);
+            storage.heap_object = moved;
         }
         set_metadata(other_metadata, inline_storage);
         copy_member_proxies<Owner, I>(owner, other);
         if (inline_storage) {
             other._si_details_.destroy();
-        } else {
+        } else if (can_steal) {
             other._si_details_.storage.heap_object = nullptr;
             other._si_details_.metadata_bits = 0;
+        } else {
+            other._si_details_.destroy();
         }
     }
 };
@@ -804,53 +859,95 @@ bool metadata_matches(const Metadata* metadata) noexcept {
            metadata->type_token == &type_token<std::remove_cvref_t<T>>;
 }
 
+template <class T>
+inline constexpr bool is_owning_existential = false;
+
+template <class I, class Allocator>
+inline constexpr bool is_owning_existential<existential<I, Allocator>> = true;
+
+template <class I, class Allocator>
+inline constexpr bool is_owning_existential<existential_move_only<I, Allocator>> = true;
+
 } // namespace detail
 
 template <class T, class I>
 concept satisfies =
     detail::has_interface_requirements<I>() &&
     (detail::satisfies_interface_members<I, T>() ||
-     std::same_as<std::remove_cvref_t<T>, existential<I>> ||
-     std::same_as<std::remove_cvref_t<T>, existential_move_only<I>> ||
+     detail::is_owning_existential<std::remove_cvref_t<T>> ||
      std::same_as<std::remove_cvref_t<T>, existential_ref<I>>);
 
-template <class I>
-class existential : public detail::generated_interface_members_t<existential<I>, I> {
+template <class I, class Allocator>
+class existential : public detail::generated_interface_members_t<
+                        existential<I, Allocator>, I> {
 public:
+    using allocator_type = Allocator;
+
     template <class T>
         requires (!std::same_as<std::remove_cvref_t<T>, existential>) &&
                  satisfies<std::remove_cvref_t<T>, I> &&
                  std::copy_constructible<std::remove_cvref_t<T>> &&
                  std::move_constructible<std::remove_cvref_t<T>>
-    existential(T&& value) {
+    existential(T&& value) : _si_details_{} {
         _si_details_.template construct_value<std::remove_cvref_t<T>>(*this, std::forward<T>(value));
     }
 
-    existential(const existential& other) {
-        _si_details_.copy_from(other._si_details_);
-        detail::copy_member_proxies<existential, I>(*this, other);
+    template <class T>
+        requires satisfies<std::remove_cvref_t<T>, I> &&
+                 std::copy_constructible<std::remove_cvref_t<T>> &&
+                 std::move_constructible<std::remove_cvref_t<T>>
+    existential(const Allocator& allocator, T&& value)
+        : _si_details_(allocator) {
+        _si_details_.template construct_value<std::remove_cvref_t<T>>(*this, std::forward<T>(value));
     }
 
-    existential(existential&& other) noexcept {
-        _si_details_.move_value_from(*this, other);
+    existential(const existential& other)
+        : _si_details_(std::allocator_traits<Allocator>::
+                           select_on_container_copy_construction(other._si_details_.allocator_ref())) {
+        _si_details_.copy_from(other._si_details_);
+        detail::copy_member_proxies<existential<I, Allocator>, I>(*this, other);
+    }
+
+    existential(existential&& other)
+        : _si_details_(std::move(other._si_details_.allocator_ref())) {
+        _si_details_.move_value_from(*this, other, true);
+    }
+
+    allocator_type get_allocator() const {
+        return _si_details_.allocator_ref();
     }
 
     existential& operator=(const existential& other) {
         if (this == &other) {
             return *this;
         }
-        _si_details_.destroy();
+        using traits = std::allocator_traits<Allocator>;
+        if constexpr (traits::propagate_on_container_copy_assignment::value) {
+            _si_details_.destroy();
+            _si_details_.allocator_ref() = other._si_details_.allocator_ref();
+        } else {
+            _si_details_.destroy();
+        }
         _si_details_.copy_from(other._si_details_);
-        detail::copy_member_proxies<existential, I>(*this, other);
+        detail::copy_member_proxies<existential<I, Allocator>, I>(*this, other);
         return *this;
     }
 
-    existential& operator=(existential&& other) noexcept {
+    existential& operator=(existential&& other) {
         if (this == &other) {
             return *this;
         }
-        _si_details_.destroy();
-        _si_details_.move_value_from(*this, other);
+        using traits = std::allocator_traits<Allocator>;
+        if constexpr (traits::propagate_on_container_move_assignment::value) {
+            _si_details_.destroy();
+            _si_details_.allocator_ref() = std::move(other._si_details_.allocator_ref());
+            _si_details_.move_value_from(*this, other, true);
+        } else {
+            bool can_steal = traits::is_always_equal::value ||
+                             (_si_details_.allocator_ref() == other._si_details_.allocator_ref());
+            _si_details_.destroy();
+            _si_details_.move_value_from(*this, other, can_steal);
+        }
         return *this;
     }
 
@@ -859,7 +956,7 @@ public:
     }
 
 private:
-    template <class, class>
+    template <class, class, class>
     friend struct detail::existential_storage;
     template <class Owner>
     friend void* detail::get_object_pointer(Owner&) noexcept;
@@ -872,52 +969,77 @@ private:
     template <class Owner, class Interface>
     friend void detail::copy_member_proxies(Owner&, const Owner&) noexcept;
 
-    template <class T, class J>
-    friend bool is(const existential<J>&) noexcept;
-    template <class T, class J>
-    friend bool is(const existential_move_only<J>&) noexcept;
+    template <class T, class J, class A>
+    friend bool is(const existential<J, A>&) noexcept;
+    template <class T, class J, class A>
+    friend bool is(const existential_move_only<J, A>&) noexcept;
     template <class T, class J>
     friend bool is(const existential_ref<J>&) noexcept;
-    template <class T, class J>
-    friend std::remove_cvref_t<T>& get(existential<J>&);
-    template <class T, class J>
-    friend const std::remove_cvref_t<T>& get(const existential<J>&);
-    template <class T, class J>
-    friend std::remove_cvref_t<T>& get(existential_move_only<J>&);
-    template <class T, class J>
-    friend const std::remove_cvref_t<T>& get(const existential_move_only<J>&);
+    template <class T, class J, class A>
+    friend std::remove_cvref_t<T>& get(existential<J, A>&);
+    template <class T, class J, class A>
+    friend const std::remove_cvref_t<T>& get(const existential<J, A>&);
+    template <class T, class J, class A>
+    friend std::remove_cvref_t<T>& get(existential_move_only<J, A>&);
+    template <class T, class J, class A>
+    friend const std::remove_cvref_t<T>& get(const existential_move_only<J, A>&);
     template <class T, class J>
     friend std::remove_cvref_t<T>& get(existential_ref<J>&);
     template <class T, class J>
     friend const std::remove_cvref_t<T>& get(const existential_ref<J>&);
 
-    detail::existential_storage<I, existential<I>> _si_details_;
+    detail::existential_storage<I, existential<I, Allocator>, Allocator> _si_details_;
 };
 
-template <class I>
-class existential_move_only : public detail::generated_interface_members_t<existential_move_only<I>, I> {
+template <class I, class Allocator>
+class existential_move_only : public detail::generated_interface_members_t<
+                                  existential_move_only<I, Allocator>, I> {
 public:
+    using allocator_type = Allocator;
+
     template <class T>
         requires (!std::same_as<std::remove_cvref_t<T>, existential_move_only>) &&
                  satisfies<std::remove_cvref_t<T>, I> &&
                  std::move_constructible<std::remove_cvref_t<T>>
-    existential_move_only(T&& value) {
+    existential_move_only(T&& value) : _si_details_{} {
+        _si_details_.template construct_value<std::remove_cvref_t<T>>(*this, std::forward<T>(value));
+    }
+
+    template <class T>
+        requires satisfies<std::remove_cvref_t<T>, I> &&
+                 std::move_constructible<std::remove_cvref_t<T>>
+    existential_move_only(const Allocator& allocator, T&& value)
+        : _si_details_(allocator) {
         _si_details_.template construct_value<std::remove_cvref_t<T>>(*this, std::forward<T>(value));
     }
 
     existential_move_only(const existential_move_only&) = delete;
     existential_move_only& operator=(const existential_move_only&) = delete;
 
-    existential_move_only(existential_move_only&& other) noexcept {
-        _si_details_.move_value_from(*this, other);
+    existential_move_only(existential_move_only&& other)
+        : _si_details_(std::move(other._si_details_.allocator_ref())) {
+        _si_details_.move_value_from(*this, other, true);
     }
 
-    existential_move_only& operator=(existential_move_only&& other) noexcept {
+    allocator_type get_allocator() const {
+        return _si_details_.allocator_ref();
+    }
+
+    existential_move_only& operator=(existential_move_only&& other) {
         if (this == &other) {
             return *this;
         }
-        _si_details_.destroy();
-        _si_details_.move_value_from(*this, other);
+        using traits = std::allocator_traits<Allocator>;
+        if constexpr (traits::propagate_on_container_move_assignment::value) {
+            _si_details_.destroy();
+            _si_details_.allocator_ref() = std::move(other._si_details_.allocator_ref());
+            _si_details_.move_value_from(*this, other, true);
+        } else {
+            bool can_steal = traits::is_always_equal::value ||
+                             (_si_details_.allocator_ref() == other._si_details_.allocator_ref());
+            _si_details_.destroy();
+            _si_details_.move_value_from(*this, other, can_steal);
+        }
         return *this;
     }
 
@@ -926,7 +1048,7 @@ public:
     }
 
 private:
-    template <class, class>
+    template <class, class, class>
     friend struct detail::existential_storage;
     template <class Owner>
     friend void* detail::get_object_pointer(Owner&) noexcept;
@@ -939,26 +1061,26 @@ private:
     template <class Owner, class Interface>
     friend void detail::copy_member_proxies(Owner&, const Owner&) noexcept;
 
-    template <class T, class J>
-    friend bool is(const existential<J>&) noexcept;
-    template <class T, class J>
-    friend bool is(const existential_move_only<J>&) noexcept;
+    template <class T, class J, class A>
+    friend bool is(const existential<J, A>&) noexcept;
+    template <class T, class J, class A>
+    friend bool is(const existential_move_only<J, A>&) noexcept;
     template <class T, class J>
     friend bool is(const existential_ref<J>&) noexcept;
-    template <class T, class J>
-    friend std::remove_cvref_t<T>& get(existential<J>&);
-    template <class T, class J>
-    friend const std::remove_cvref_t<T>& get(const existential<J>&);
-    template <class T, class J>
-    friend std::remove_cvref_t<T>& get(existential_move_only<J>&);
-    template <class T, class J>
-    friend const std::remove_cvref_t<T>& get(const existential_move_only<J>&);
+    template <class T, class J, class A>
+    friend std::remove_cvref_t<T>& get(existential<J, A>&);
+    template <class T, class J, class A>
+    friend const std::remove_cvref_t<T>& get(const existential<J, A>&);
+    template <class T, class J, class A>
+    friend std::remove_cvref_t<T>& get(existential_move_only<J, A>&);
+    template <class T, class J, class A>
+    friend const std::remove_cvref_t<T>& get(const existential_move_only<J, A>&);
     template <class T, class J>
     friend std::remove_cvref_t<T>& get(existential_ref<J>&);
     template <class T, class J>
     friend const std::remove_cvref_t<T>& get(const existential_ref<J>&);
 
-    detail::existential_storage<I, existential_move_only<I>> _si_details_;
+    detail::existential_storage<I, existential_move_only<I, Allocator>, Allocator> _si_details_;
 };
 
 template <class I>
@@ -984,20 +1106,20 @@ private:
     template <class Owner, class Interface, class T>
     friend void detail::bind_member_proxies(Owner&) noexcept;
 
-    template <class T, class J>
-    friend bool is(const existential<J>&) noexcept;
-    template <class T, class J>
-    friend bool is(const existential_move_only<J>&) noexcept;
+    template <class T, class J, class A>
+    friend bool is(const existential<J, A>&) noexcept;
+    template <class T, class J, class A>
+    friend bool is(const existential_move_only<J, A>&) noexcept;
     template <class T, class J>
     friend bool is(const existential_ref<J>&) noexcept;
-    template <class T, class J>
-    friend std::remove_cvref_t<T>& get(existential<J>&);
-    template <class T, class J>
-    friend const std::remove_cvref_t<T>& get(const existential<J>&);
-    template <class T, class J>
-    friend std::remove_cvref_t<T>& get(existential_move_only<J>&);
-    template <class T, class J>
-    friend const std::remove_cvref_t<T>& get(const existential_move_only<J>&);
+    template <class T, class J, class A>
+    friend std::remove_cvref_t<T>& get(existential<J, A>&);
+    template <class T, class J, class A>
+    friend const std::remove_cvref_t<T>& get(const existential<J, A>&);
+    template <class T, class J, class A>
+    friend std::remove_cvref_t<T>& get(existential_move_only<J, A>&);
+    template <class T, class J, class A>
+    friend const std::remove_cvref_t<T>& get(const existential_move_only<J, A>&);
     template <class T, class J>
     friend std::remove_cvref_t<T>& get(existential_ref<J>&);
     template <class T, class J>
@@ -1006,13 +1128,13 @@ private:
     detail::reference_storage<std::remove_cv_t<I>> _si_details_;
 };
 
-template <class T, class I>
-bool is(const existential<I>& object) noexcept {
+template <class T, class I, class Allocator>
+bool is(const existential<I, Allocator>& object) noexcept {
     return detail::metadata_matches<T>(object._si_details_.metadata_ptr());
 }
 
-template <class T, class I>
-bool is(const existential_move_only<I>& object) noexcept {
+template <class T, class I, class Allocator>
+bool is(const existential_move_only<I, Allocator>& object) noexcept {
     return detail::metadata_matches<T>(object._si_details_.metadata_ptr());
 }
 
@@ -1021,8 +1143,8 @@ bool is(const existential_ref<I>& object) noexcept {
     return detail::metadata_matches<T>(object._si_details_.metadata_ptr());
 }
 
-template <class T, class I>
-std::remove_cvref_t<T>& get(existential<I>& object) {
+template <class T, class I, class Allocator>
+std::remove_cvref_t<T>& get(existential<I, Allocator>& object) {
     using concrete = std::remove_cvref_t<T>;
     if (!is<T>(object)) {
         throw std::bad_cast{};
@@ -1030,8 +1152,8 @@ std::remove_cvref_t<T>& get(existential<I>& object) {
     return *static_cast<concrete*>(detail::get_object_pointer(object));
 }
 
-template <class T, class I>
-const std::remove_cvref_t<T>& get(const existential<I>& object) {
+template <class T, class I, class Allocator>
+const std::remove_cvref_t<T>& get(const existential<I, Allocator>& object) {
     using concrete = std::remove_cvref_t<T>;
     if (!is<T>(object)) {
         throw std::bad_cast{};
@@ -1039,8 +1161,8 @@ const std::remove_cvref_t<T>& get(const existential<I>& object) {
     return *static_cast<const concrete*>(detail::get_const_object_pointer(object));
 }
 
-template <class T, class I>
-std::remove_cvref_t<T>& get(existential_move_only<I>& object) {
+template <class T, class I, class Allocator>
+std::remove_cvref_t<T>& get(existential_move_only<I, Allocator>& object) {
     using concrete = std::remove_cvref_t<T>;
     if (!is<T>(object)) {
         throw std::bad_cast{};
@@ -1048,8 +1170,8 @@ std::remove_cvref_t<T>& get(existential_move_only<I>& object) {
     return *static_cast<concrete*>(detail::get_object_pointer(object));
 }
 
-template <class T, class I>
-const std::remove_cvref_t<T>& get(const existential_move_only<I>& object) {
+template <class T, class I, class Allocator>
+const std::remove_cvref_t<T>& get(const existential_move_only<I, Allocator>& object) {
     using concrete = std::remove_cvref_t<T>;
     if (!is<T>(object)) {
         throw std::bad_cast{};

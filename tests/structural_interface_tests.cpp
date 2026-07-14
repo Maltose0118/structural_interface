@@ -1,8 +1,10 @@
 #include <boost/ut.hpp>
 #include <structural_interface.hpp>
 
+#include <array>
 #include <concepts>
 #include <memory>
+#include <memory_resource>
 #include <utility>
 
 struct Drawable {
@@ -47,6 +49,82 @@ class PrivateDrawable {
 struct MoveOnlyDrawable {
     std::unique_ptr<int> value = std::make_unique<int>(42);
     void draw() const {}
+};
+
+struct LargeDrawable {
+    std::array<std::byte, 64> payload{};
+    void draw() const {}
+};
+
+template <class T, bool PropagateCopy = false, bool PropagateMove = false>
+struct counting_allocator {
+    using value_type = T;
+    using propagate_on_container_copy_assignment = std::bool_constant<PropagateCopy>;
+    using propagate_on_container_move_assignment = std::bool_constant<PropagateMove>;
+    using is_always_equal = std::false_type;
+
+    int* allocations = nullptr;
+    int* deallocations = nullptr;
+    int id = 0;
+
+    counting_allocator() = default;
+
+    counting_allocator(int* allocations, int* deallocations, int id)
+        : allocations(allocations), deallocations(deallocations), id(id) {}
+
+    template <class U>
+    counting_allocator(const counting_allocator<U, PropagateCopy, PropagateMove>& other)
+        : allocations(other.allocations), deallocations(other.deallocations), id(other.id) {}
+
+    T* allocate(std::size_t count) {
+        ++*allocations;
+        return std::allocator<T>{}.allocate(count);
+    }
+
+    void deallocate(T* object, std::size_t count) noexcept {
+        ++*deallocations;
+        std::allocator<T>{}.deallocate(object, count);
+    }
+
+    counting_allocator select_on_container_copy_construction() const {
+        auto selected = *this;
+        ++selected.id;
+        return selected;
+    }
+
+    template <class U>
+    struct rebind {
+        using other = counting_allocator<U, PropagateCopy, PropagateMove>;
+    };
+
+    template <class U, bool OtherCopy, bool OtherMove>
+    friend struct counting_allocator;
+
+    template <class U>
+    friend bool operator==(const counting_allocator& left,
+                           const counting_allocator<U, PropagateCopy, PropagateMove>& right) {
+        return left.id == right.id;
+    }
+};
+
+struct counting_resource : std::pmr::memory_resource {
+    int allocations = 0;
+    int deallocations = 0;
+
+private:
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+        ++allocations;
+        return std::pmr::new_delete_resource()->allocate(bytes, alignment);
+    }
+
+    void do_deallocate(void* pointer, std::size_t bytes, std::size_t alignment) override {
+        ++deallocations;
+        std::pmr::new_delete_resource()->deallocate(pointer, bytes, alignment);
+    }
+
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
 };
 
 struct Consumable {
@@ -175,6 +253,93 @@ int main() {
         expect(threw);
     };
 
+    "default allocator keeps the existing layout"_test = [] {
+        using default_existential = si::existential<Drawable>;
+        using explicit_default_existential =
+            si::existential<Drawable, std::allocator<std::byte>>;
+        static_assert(std::same_as<default_existential, explicit_default_existential>);
+        static_assert(sizeof(default_existential) == sizeof(explicit_default_existential));
+
+        default_existential value = Circle{};
+        expect(si::is<Circle>(value));
+    };
+
+    "custom allocator handles heap storage and copy selection"_test = [] {
+        int allocations = 0;
+        int deallocations = 0;
+        using allocator = counting_allocator<std::byte>;
+        allocator source_allocator{&allocations, &deallocations, 7};
+
+        using value_type = si::existential<Drawable, allocator>;
+        value_type value{source_allocator, LargeDrawable{}};
+        expect(allocations == 1_i);
+        expect(value.get_allocator().id == 7_i);
+
+        auto copy = value;
+        expect(allocations == 2_i);
+        expect(copy.get_allocator().id == 8_i);
+
+        copy = value;
+        expect(deallocations == 1_i);
+        expect(copy.get_allocator().id == 8_i);
+
+        value_type equal_source{
+            allocator{&allocations, &deallocations, 9}, LargeDrawable{}};
+        value_type equal_target{
+            allocator{&allocations, &deallocations, 9}, LargeDrawable{}};
+        int allocations_before_equal_move = allocations;
+        equal_target = std::move(equal_source);
+        expect(allocations == allocations_before_equal_move);
+    };
+
+    "pmr allocator receives heap allocation requests"_test = [] {
+        counting_resource resource;
+        using allocator = std::pmr::polymorphic_allocator<std::byte>;
+        using value_type = si::existential<Drawable, allocator>;
+
+        value_type value{allocator{&resource}, LargeDrawable{}};
+        expect(resource.allocations == 1_i);
+        expect(value.get_allocator().resource() == &resource);
+        expect(si::is<LargeDrawable>(value));
+    };
+
+    "allocator propagation follows allocator traits"_test = [] {
+        int left_allocations = 0;
+        int left_deallocations = 0;
+        int right_allocations = 0;
+        int right_deallocations = 0;
+
+        using nonpropagating = counting_allocator<std::byte>;
+        using copy_propagating = counting_allocator<std::byte, true, false>;
+        using propagating = counting_allocator<std::byte, false, true>;
+        using value_type = si::existential<Drawable, nonpropagating>;
+        using propagating_value_type = si::existential<Drawable, propagating>;
+
+        value_type source{
+            nonpropagating{&left_allocations, &left_deallocations, 1}, LargeDrawable{}};
+        value_type target{
+            nonpropagating{&right_allocations, &right_deallocations, 2}, LargeDrawable{}};
+        target = std::move(source);
+        expect(target.get_allocator().id == 2_i);
+        expect(right_allocations == 2_i);
+
+        using copy_propagating_value_type =
+            si::existential<Drawable, copy_propagating>;
+        copy_propagating_value_type copy_source{
+            copy_propagating{&left_allocations, &left_deallocations, 5}, LargeDrawable{}};
+        copy_propagating_value_type copy_target{
+            copy_propagating{&right_allocations, &right_deallocations, 6}, LargeDrawable{}};
+        copy_target = copy_source;
+        expect(copy_target.get_allocator().id == 5_i);
+
+        propagating_value_type propagated_source{
+            propagating{&left_allocations, &left_deallocations, 3}, LargeDrawable{}};
+        propagating_value_type propagated_target{
+            propagating{&right_allocations, &right_deallocations, 4}, LargeDrawable{}};
+        propagated_target = std::move(propagated_source);
+        expect(propagated_target.get_allocator().id == 3_i);
+    };
+
     "owning existential exposes reflected call members"_test = [] {
         si::existential<MutableCounter> counter = Circle{};
         static_assert(std::same_as<decltype(counter.value), int*>);
@@ -220,6 +385,18 @@ int main() {
         expect(!si::is<MoveOnlyDrawable>(drawable));
         expect(*si::get<MoveOnlyDrawable>(moved).value == 42_i);
         moved.draw();
+    };
+
+    "move only existential supports custom allocators"_test = [] {
+        int allocations = 0;
+        int deallocations = 0;
+        using allocator = counting_allocator<std::byte>;
+        using value_type = si::existential_move_only<Drawable, allocator>;
+
+        value_type value{allocator{&allocations, &deallocations, 1}, LargeDrawable{}};
+        auto moved = std::move(value);
+        expect(si::is<LargeDrawable>(moved));
+        expect(allocations == 1_i);
     };
 
     "rvalue qualified reflected calls dispatch to moved concrete object"_test = [] {
