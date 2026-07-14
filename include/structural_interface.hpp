@@ -579,6 +579,11 @@ struct interface_metadata {
     void (*move_construct)(void*, void*) noexcept;
 };
 
+template <class I>
+struct reference_metadata {
+    generated_function_slots_t<I> functions;
+};
+
 template <class T>
 inline constexpr bool fits_sbo =
     sizeof(T) <= sbo_storage_size &&
@@ -624,6 +629,11 @@ inline const interface_metadata<I> metadata_for = {
     .destroy = &destroy_object<T>,
     .copy_construct = get_copy_constructor<T>(),
     .move_construct = &move_construct_object<T>,
+};
+
+template <class I, class T>
+inline const reference_metadata<I> reference_metadata_for = {
+    .functions = make_function_slots<I, T>(),
 };
 
 template <class I, class Owner>
@@ -731,23 +741,23 @@ struct existential_storage {
     }
 };
 
-template <class I, class Owner>
+template <class I>
 struct reference_storage {
     void* object = nullptr;
-    const interface_metadata<I>* metadata = nullptr;
+    const reference_metadata<I>* metadata = nullptr;
 
     void* object_ptr() const noexcept {
         return object;
     }
 
-    const interface_metadata<I>* metadata_ptr() const noexcept {
+    const reference_metadata<I>* metadata_ptr() const noexcept {
         return metadata;
     }
 
     template <class T>
     void bind(T& value) noexcept {
         object = std::addressof(value);
-        metadata = &metadata_for<I, std::remove_cvref_t<T>>;
+        metadata = &reference_metadata_for<I, std::remove_cvref_t<T>>;
     }
 };
 
@@ -884,7 +894,7 @@ private:
     template <class Owner, class Interface, class T>
     friend void detail::bind_member_proxies(Owner&) noexcept;
 
-    detail::reference_storage<I, existential_ref<I>> _si_details_;
+    detail::reference_storage<I> _si_details_;
 };
 
 } // namespace si
