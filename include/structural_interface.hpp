@@ -9,6 +9,7 @@
 #include <new>
 #include <string>
 #include <type_traits>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -27,6 +28,13 @@ inline constexpr std::size_t sbo_storage_size = sizeof(void*) * 2;
 inline constexpr std::size_t sbo_storage_alignment = alignof(void*);
 
 namespace detail {
+
+template <class Owner>
+inline constexpr bool read_only_reference_owner = false;
+
+template <class I>
+inline constexpr bool read_only_reference_owner<si::existential_ref<I>> =
+    std::is_const_v<I>;
 
 using meta_info = std::meta::info;
 
@@ -290,6 +298,12 @@ void* get_concrete_field_address(void* object) noexcept {
     return std::addressof(static_cast<T*>(object)->*member);
 }
 
+template <auto InterfaceMember, class T>
+const void* get_concrete_field_address(const void* object) noexcept {
+    constexpr auto member = get_concrete_member_pointer<InterfaceMember, T>();
+    return std::addressof(static_cast<const T*>(object)->*member);
+}
+
 template <auto InterfaceMember, class Signature = member_pointer_type_t<InterfaceMember>>
 struct erased_function_pointer;
 
@@ -429,7 +443,9 @@ struct generated_interface_members {
     consteval {
         std::vector<meta_info> specs;
         template for (constexpr auto member : [: reflected_members(^^I) :]) {
-            if constexpr (is_interface_function(member)) {
+            if constexpr (is_interface_function(member) &&
+                          (!read_only_reference_owner<Owner> ||
+                           std::meta::is_const(member))) {
                 using proxy_type = function_proxy<Owner, member>;
                 specs.push_back(std::meta::data_member_spec(
                     ^^proxy_type,
@@ -437,8 +453,10 @@ struct generated_interface_members {
                      .no_unique_address = true}));
             } else if constexpr (is_interface_field(member)) {
                 using field_type = member_object_type_t<member>;
+                using field_pointer = std::conditional_t<
+                    read_only_reference_owner<Owner>, const field_type*, field_type*>;
                 specs.push_back(std::meta::data_member_spec(
-                    ^^field_type*,
+                    ^^field_pointer,
                     {.name = std::string(std::meta::identifier_of(member))}));
             }
         }
@@ -451,16 +469,28 @@ void* get_object_pointer(Owner& owner) noexcept {
     return owner._si_details_.object_ptr();
 }
 
+template <class Owner>
+const void* get_const_object_pointer(const Owner& owner) noexcept {
+    return owner._si_details_.object_ptr();
+}
+
 template <class Owner, class I, class T>
 void bind_member_proxies(Owner& owner) noexcept {
     template for (constexpr auto member : [: reflected_members(^^I) :]) {
         if constexpr (is_interface_field(member)) {
             using field_type = member_object_type_t<member>;
+            using field_pointer = std::conditional_t<
+                read_only_reference_owner<Owner>, const field_type*, field_type*>;
             constexpr auto base_member =
-                get_member_pointer<generated_interface_members_t<Owner, I>, member, field_type*>();
-            owner.*base_member =
-                static_cast<field_type*>(
+                get_member_pointer<generated_interface_members_t<Owner, I>, member, field_pointer>();
+            if constexpr (read_only_reference_owner<Owner>) {
+                owner.*base_member = static_cast<field_pointer>(
+                    get_concrete_field_address<member, T>(
+                        static_cast<const void*>(owner._si_details_.object_ptr())));
+            } else {
+                owner.*base_member = static_cast<field_pointer>(
                     get_concrete_field_address<member, T>(get_object_pointer(owner)));
+            }
         }
     }
 }
@@ -574,6 +604,7 @@ consteval bool satisfies_interface_members() {
 template <class I>
 struct interface_metadata {
     generated_function_slots_t<I> functions;
+    const void* type_token;
     void (*destroy)(void*, bool) noexcept;
     void* (*copy_construct)(void*, const void*, bool);
     void (*move_construct)(void*, void*) noexcept;
@@ -582,7 +613,11 @@ struct interface_metadata {
 template <class I>
 struct reference_metadata {
     generated_function_slots_t<I> functions;
+    const void* type_token;
 };
+
+template <class T>
+inline constexpr char type_token = 0;
 
 template <class T>
 inline constexpr bool fits_sbo =
@@ -626,6 +661,7 @@ void move_construct_object(void* destination_storage, void* source) noexcept {
 template <class I, class T>
 inline const interface_metadata<I> metadata_for = {
     .functions = make_function_slots<I, T>(),
+    .type_token = &type_token<T>,
     .destroy = &destroy_object<T>,
     .copy_construct = get_copy_constructor<T>(),
     .move_construct = &move_construct_object<T>,
@@ -634,6 +670,7 @@ inline const interface_metadata<I> metadata_for = {
 template <class I, class T>
 inline const reference_metadata<I> reference_metadata_for = {
     .functions = make_function_slots<I, T>(),
+    .type_token = &type_token<T>,
 };
 
 template <class I, class Owner>
@@ -743,11 +780,11 @@ struct existential_storage {
 
 template <class I>
 struct reference_storage {
-    void* object = nullptr;
+    const void* object = nullptr;
     const reference_metadata<I>* metadata = nullptr;
 
     void* object_ptr() const noexcept {
-        return object;
+        return const_cast<void*>(object);
     }
 
     const reference_metadata<I>* metadata_ptr() const noexcept {
@@ -760,6 +797,12 @@ struct reference_storage {
         metadata = &reference_metadata_for<I, std::remove_cvref_t<T>>;
     }
 };
+
+template <class T, class Metadata>
+bool metadata_matches(const Metadata* metadata) noexcept {
+    return metadata != nullptr &&
+           metadata->type_token == &type_token<std::remove_cvref_t<T>>;
+}
 
 } // namespace detail
 
@@ -820,12 +863,33 @@ private:
     friend struct detail::existential_storage;
     template <class Owner>
     friend void* detail::get_object_pointer(Owner&) noexcept;
+    template <class Owner>
+    friend const void* detail::get_const_object_pointer(const Owner&) noexcept;
     template <class, auto, class>
     friend struct detail::function_proxy;
     template <class Owner, class Interface, class T>
     friend void detail::bind_member_proxies(Owner&) noexcept;
     template <class Owner, class Interface>
     friend void detail::copy_member_proxies(Owner&, const Owner&) noexcept;
+
+    template <class T, class J>
+    friend bool is(const existential<J>&) noexcept;
+    template <class T, class J>
+    friend bool is(const existential_move_only<J>&) noexcept;
+    template <class T, class J>
+    friend bool is(const existential_ref<J>&) noexcept;
+    template <class T, class J>
+    friend std::remove_cvref_t<T>& get(existential<J>&);
+    template <class T, class J>
+    friend const std::remove_cvref_t<T>& get(const existential<J>&);
+    template <class T, class J>
+    friend std::remove_cvref_t<T>& get(existential_move_only<J>&);
+    template <class T, class J>
+    friend const std::remove_cvref_t<T>& get(const existential_move_only<J>&);
+    template <class T, class J>
+    friend std::remove_cvref_t<T>& get(existential_ref<J>&);
+    template <class T, class J>
+    friend const std::remove_cvref_t<T>& get(const existential_ref<J>&);
 
     detail::existential_storage<I, existential<I>> _si_details_;
 };
@@ -866,6 +930,8 @@ private:
     friend struct detail::existential_storage;
     template <class Owner>
     friend void* detail::get_object_pointer(Owner&) noexcept;
+    template <class Owner>
+    friend const void* detail::get_const_object_pointer(const Owner&) noexcept;
     template <class, auto, class>
     friend struct detail::function_proxy;
     template <class Owner, class Interface, class T>
@@ -873,17 +939,39 @@ private:
     template <class Owner, class Interface>
     friend void detail::copy_member_proxies(Owner&, const Owner&) noexcept;
 
+    template <class T, class J>
+    friend bool is(const existential<J>&) noexcept;
+    template <class T, class J>
+    friend bool is(const existential_move_only<J>&) noexcept;
+    template <class T, class J>
+    friend bool is(const existential_ref<J>&) noexcept;
+    template <class T, class J>
+    friend std::remove_cvref_t<T>& get(existential<J>&);
+    template <class T, class J>
+    friend const std::remove_cvref_t<T>& get(const existential<J>&);
+    template <class T, class J>
+    friend std::remove_cvref_t<T>& get(existential_move_only<J>&);
+    template <class T, class J>
+    friend const std::remove_cvref_t<T>& get(const existential_move_only<J>&);
+    template <class T, class J>
+    friend std::remove_cvref_t<T>& get(existential_ref<J>&);
+    template <class T, class J>
+    friend const std::remove_cvref_t<T>& get(const existential_ref<J>&);
+
     detail::existential_storage<I, existential_move_only<I>> _si_details_;
 };
 
 template <class I>
-class existential_ref : public detail::generated_interface_members_t<existential_ref<I>, I> {
+class existential_ref : public detail::generated_interface_members_t<
+                            existential_ref<I>, std::remove_cv_t<I>> {
 public:
     template <class T>
-        requires satisfies<std::remove_cvref_t<T>, I>
+        requires ((!std::is_const_v<T> || std::is_const_v<I>) &&
+                  satisfies<std::remove_cvref_t<T>, std::remove_cv_t<I>>)
     existential_ref(T& value) noexcept {
         _si_details_.bind(value);
-        detail::bind_member_proxies<existential_ref, I, std::remove_cvref_t<T>>(*this);
+        detail::bind_member_proxies<
+            existential_ref, std::remove_cv_t<I>, std::remove_cvref_t<T>>(*this);
     }
 
 private:
@@ -891,10 +979,101 @@ private:
     friend struct detail::function_proxy;
     template <class Owner>
     friend void* detail::get_object_pointer(Owner&) noexcept;
+    template <class Owner>
+    friend const void* detail::get_const_object_pointer(const Owner&) noexcept;
     template <class Owner, class Interface, class T>
     friend void detail::bind_member_proxies(Owner&) noexcept;
 
-    detail::reference_storage<I> _si_details_;
+    template <class T, class J>
+    friend bool is(const existential<J>&) noexcept;
+    template <class T, class J>
+    friend bool is(const existential_move_only<J>&) noexcept;
+    template <class T, class J>
+    friend bool is(const existential_ref<J>&) noexcept;
+    template <class T, class J>
+    friend std::remove_cvref_t<T>& get(existential<J>&);
+    template <class T, class J>
+    friend const std::remove_cvref_t<T>& get(const existential<J>&);
+    template <class T, class J>
+    friend std::remove_cvref_t<T>& get(existential_move_only<J>&);
+    template <class T, class J>
+    friend const std::remove_cvref_t<T>& get(const existential_move_only<J>&);
+    template <class T, class J>
+    friend std::remove_cvref_t<T>& get(existential_ref<J>&);
+    template <class T, class J>
+    friend const std::remove_cvref_t<T>& get(const existential_ref<J>&);
+
+    detail::reference_storage<std::remove_cv_t<I>> _si_details_;
 };
+
+template <class T, class I>
+bool is(const existential<I>& object) noexcept {
+    return detail::metadata_matches<T>(object._si_details_.metadata_ptr());
+}
+
+template <class T, class I>
+bool is(const existential_move_only<I>& object) noexcept {
+    return detail::metadata_matches<T>(object._si_details_.metadata_ptr());
+}
+
+template <class T, class I>
+bool is(const existential_ref<I>& object) noexcept {
+    return detail::metadata_matches<T>(object._si_details_.metadata_ptr());
+}
+
+template <class T, class I>
+std::remove_cvref_t<T>& get(existential<I>& object) {
+    using concrete = std::remove_cvref_t<T>;
+    if (!is<T>(object)) {
+        throw std::bad_cast{};
+    }
+    return *static_cast<concrete*>(detail::get_object_pointer(object));
+}
+
+template <class T, class I>
+const std::remove_cvref_t<T>& get(const existential<I>& object) {
+    using concrete = std::remove_cvref_t<T>;
+    if (!is<T>(object)) {
+        throw std::bad_cast{};
+    }
+    return *static_cast<const concrete*>(detail::get_const_object_pointer(object));
+}
+
+template <class T, class I>
+std::remove_cvref_t<T>& get(existential_move_only<I>& object) {
+    using concrete = std::remove_cvref_t<T>;
+    if (!is<T>(object)) {
+        throw std::bad_cast{};
+    }
+    return *static_cast<concrete*>(detail::get_object_pointer(object));
+}
+
+template <class T, class I>
+const std::remove_cvref_t<T>& get(const existential_move_only<I>& object) {
+    using concrete = std::remove_cvref_t<T>;
+    if (!is<T>(object)) {
+        throw std::bad_cast{};
+    }
+    return *static_cast<const concrete*>(detail::get_const_object_pointer(object));
+}
+
+template <class T, class I>
+    requires (!std::is_const_v<I>)
+std::remove_cvref_t<T>& get(existential_ref<I>& object) {
+    using concrete = std::remove_cvref_t<T>;
+    if (!is<T>(object)) {
+        throw std::bad_cast{};
+    }
+    return *static_cast<concrete*>(detail::get_object_pointer(object));
+}
+
+template <class T, class I>
+const std::remove_cvref_t<T>& get(const existential_ref<I>& object) {
+    using concrete = std::remove_cvref_t<T>;
+    if (!is<T>(object)) {
+        throw std::bad_cast{};
+    }
+    return *static_cast<const concrete*>(detail::get_const_object_pointer(object));
+}
 
 } // namespace si
