@@ -43,4 +43,20 @@ int main() {
 
     *(shapes[0].name) = "Updated Circle"; // modify field
     std::println("Updated shape name: {}", *(shapes[0].name));
+
+    if (si::is<Circle>(shapes[0])) {
+        Circle& concrete = si::get<Circle>(shapes[0]);
+        std::println("Concrete type: {}, radius: {}", concrete.name, concrete.radius);
+    }
+
+    const auto& const_shape = shapes[0];
+    const Circle& const_concrete = si::get<Circle>(const_shape);
+    std::println("Const view: {}", const_concrete.name);
+
+    Circle borrowed_circle{ "Borrowed Circle", 2.0f };
+    si::existential_ref<Shape> reference = borrowed_circle;
+    if (si::is<Circle>(reference)) {
+        si::get<Circle>(reference).radius = 3.0f;
+    }
+    std::println("Borrowed shape area: {}", borrowed_circle.area());
 }

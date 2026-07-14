@@ -124,6 +124,35 @@ int main() {
 }
 ```
 
+### Step 5: Runtime type inspection
+
+Runtime wrappers provide the free functions `si::is<T>` and `si::get<T>` for exact concrete-type inspection. `get<T>` returns a reference and does not transfer ownership; a mismatch throws `std::bad_cast`.
+
+```cpp
+si::existential<Drawable> shape = Circle{ "circle" };
+
+if (si::is<Circle>(shape)) {
+    Circle& circle = si::get<Circle>(shape);
+    circle.draw();
+}
+
+const auto& const_shape = shape;
+const Circle& const_circle = si::get<Circle>(const_shape);
+
+Circle circle{ "borrowed" };
+si::existential_ref<Drawable> reference = circle;
+Circle& borrowed = si::get<Circle>(reference);
+borrowed.name = "updated";
+```
+
+`si::existential_ref<const I>` provides a read-only view and `get<T>` returns `const T&`.
+
+```cpp
+const Circle circle{ "read-only" };
+si::existential_ref<const Drawable> reference = circle;
+const Circle& value = si::get<Circle>(reference);
+```
+
 The full example can be found at [examples/basic.cpp](examples/basic.cpp).
 
 ## Goals

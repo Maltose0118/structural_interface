@@ -121,6 +121,35 @@ int main() {
 }
 ```
 
+### 第五步：运行时类型检查
+
+运行时包装器提供自由函数 `si::is<T>` 和 `si::get<T>`，用于精确检查具体类型。`get<T>` 返回引用，不转移所有权；类型不匹配时抛出 `std::bad_cast`。
+
+```cpp
+si::existential<Drawable> shape = Circle{ "circle" };
+
+if (si::is<Circle>(shape)) {
+    Circle& circle = si::get<Circle>(shape);
+    circle.draw();
+}
+
+const auto& const_shape = shape;
+const Circle& const_circle = si::get<Circle>(const_shape);
+
+Circle circle{ "borrowed" };
+si::existential_ref<Drawable> reference = circle;
+Circle& borrowed = si::get<Circle>(reference);
+borrowed.name = "updated";
+```
+
+`si::existential_ref<const I>` 提供只读视图，`get<T>` 返回 `const T&`。
+
+```cpp
+const Circle circle{ "read-only" };
+si::existential_ref<const Drawable> reference = circle;
+const Circle& value = si::get<Circle>(reference);
+```
+
 完整示例在 [examples/basic.cpp](examples/basic.cpp)。
 
 ## 目标
